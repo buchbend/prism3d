@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=65.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "prism3d"
+version = "0.5.0"
+description = "3D PDR code with THEMIS dust evolution and ML-accelerated chemistry"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.20",
+    "scipy>=1.7",
+    "matplotlib>=3.5",
+    "scikit-learn>=1.0",
+]
+
+[project.optional-dependencies]
+hpc = ["mpi4py", "h5py", "cupy-cuda12x"]
+fits = ["astropy>=5.0"]
+all = ["mpi4py", "h5py", "astropy>=5.0"]
+
+[project.scripts]
+prism3d = "prism3d.run:main"
+
+[tool.setuptools.packages.find]
+include = ["prism3d*"]

@@ -1,0 +1,2 @@
+[console_scripts]
+prism3d = prism3d.run:main

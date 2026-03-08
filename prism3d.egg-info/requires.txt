@@ -1,0 +1,17 @@
+numpy>=1.20
+scipy>=1.7
+matplotlib>=3.5
+scikit-learn>=1.0
+
+[all]
+mpi4py
+h5py
+astropy>=5.0
+
+[fits]
+astropy>=5.0
+
+[hpc]
+mpi4py
+h5py
+cupy-cuda12x

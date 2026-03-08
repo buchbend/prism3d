@@ -1,0 +1,21 @@
+Metadata-Version: 2.4
+Name: prism3d
+Version: 0.5.0
+Summary: 3D PDR code with THEMIS dust evolution and ML-accelerated chemistry
+License: MIT
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: numpy>=1.20
+Requires-Dist: scipy>=1.7
+Requires-Dist: matplotlib>=3.5
+Requires-Dist: scikit-learn>=1.0
+Provides-Extra: hpc
+Requires-Dist: mpi4py; extra == "hpc"
+Requires-Dist: h5py; extra == "hpc"
+Requires-Dist: cupy-cuda12x; extra == "hpc"
+Provides-Extra: fits
+Requires-Dist: astropy>=5.0; extra == "fits"
+Provides-Extra: all
+Requires-Dist: mpi4py; extra == "all"
+Requires-Dist: h5py; extra == "all"
+Requires-Dist: astropy>=5.0; extra == "all"

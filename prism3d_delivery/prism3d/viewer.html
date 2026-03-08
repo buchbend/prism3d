@@ -1,0 +1,720 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PRISM-3D Interactive Viewer</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;500;700&family=Space+Grotesk:wght@400;600;700&display=swap');
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: #0a0a0f;
+    color: #e0e0e0;
+    font-family: 'Space Grotesk', sans-serif;
+    overflow: hidden;
+    height: 100vh;
+  }
+
+  #canvas-container {
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+  }
+
+  canvas { display: block; }
+
+  /* Control Panel */
+  #controls {
+    position: absolute;
+    top: 20px; right: 20px;
+    width: 320px;
+    background: rgba(10, 10, 20, 0.92);
+    backdrop-filter: blur(20px);
+    border: 1px solid rgba(100, 180, 255, 0.15);
+    border-radius: 16px;
+    padding: 20px;
+    z-index: 100;
+    max-height: calc(100vh - 40px);
+    overflow-y: auto;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
+  }
+
+  #controls::-webkit-scrollbar { width: 4px; }
+  #controls::-webkit-scrollbar-thumb { background: rgba(100,180,255,0.3); border-radius: 4px; }
+
+  .panel-title {
+    font-family: 'Space Grotesk', sans-serif;
+    font-size: 18px;
+    font-weight: 700;
+    color: #64b5f6;
+    margin-bottom: 4px;
+    letter-spacing: 1px;
+  }
+
+  .panel-subtitle {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    color: #5a6a80;
+    margin-bottom: 16px;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+  }
+
+  .section {
+    margin-bottom: 16px;
+    padding-bottom: 12px;
+    border-bottom: 1px solid rgba(100, 180, 255, 0.08);
+  }
+
+  .section-label {
+    font-size: 11px;
+    font-weight: 600;
+    color: #90a4ae;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    margin-bottom: 8px;
+  }
+
+  .tracer-btn {
+    display: inline-block;
+    padding: 6px 12px;
+    margin: 3px;
+    border: 1px solid rgba(100, 180, 255, 0.2);
+    border-radius: 8px;
+    background: rgba(30, 40, 60, 0.6);
+    color: #b0bec5;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+
+  .tracer-btn:hover {
+    background: rgba(50, 70, 100, 0.8);
+    border-color: rgba(100, 180, 255, 0.5);
+  }
+
+  .tracer-btn.active {
+    background: rgba(33, 150, 243, 0.3);
+    border-color: #2196f3;
+    color: #ffffff;
+    box-shadow: 0 0 12px rgba(33, 150, 243, 0.2);
+  }
+
+  .slider-row {
+    display: flex;
+    align-items: center;
+    margin: 6px 0;
+  }
+
+  .slider-row label {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: #78909c;
+    width: 80px;
+    flex-shrink: 0;
+  }
+
+  .slider-row input[type="range"] {
+    flex: 1;
+    -webkit-appearance: none;
+    height: 4px;
+    background: rgba(100, 180, 255, 0.15);
+    border-radius: 2px;
+    outline: none;
+  }
+
+  .slider-row input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 14px; height: 14px;
+    border-radius: 50%;
+    background: #2196f3;
+    cursor: pointer;
+    box-shadow: 0 0 8px rgba(33, 150, 243, 0.4);
+  }
+
+  .slider-val {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: #64b5f6;
+    width: 40px;
+    text-align: right;
+  }
+
+  .view-btn {
+    padding: 8px 16px;
+    margin: 4px;
+    border: 1px solid rgba(100, 180, 255, 0.2);
+    border-radius: 8px;
+    background: rgba(30, 40, 60, 0.6);
+    color: #b0bec5;
+    font-family: 'Space Grotesk', sans-serif;
+    font-size: 12px;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+
+  .view-btn:hover { background: rgba(50, 70, 100, 0.8); color: #fff; }
+  .view-btn.active { background: rgba(33, 150, 243, 0.3); border-color: #2196f3; color: #fff; }
+
+  /* Info overlay */
+  #info {
+    position: absolute;
+    bottom: 20px; left: 20px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: rgba(180, 200, 220, 0.6);
+    z-index: 100;
+  }
+
+  /* Color bar */
+  #colorbar {
+    position: absolute;
+    bottom: 20px; right: 360px;
+    width: 200px; height: 20px;
+    border-radius: 4px;
+    z-index: 100;
+  }
+  #colorbar-label {
+    position: absolute;
+    bottom: 44px; right: 360px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: #90a4ae;
+    z-index: 100;
+  }
+  #colorbar-range {
+    position: absolute;
+    bottom: 4px; right: 360px;
+    width: 200px;
+    display: flex; justify-content: space-between;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    color: #78909c;
+    z-index: 100;
+  }
+</style>
+</head>
+<body>
+
+<div id="canvas-container"></div>
+
+<!-- Control Panel -->
+<div id="controls">
+  <div class="panel-title">PRISM-3D</div>
+  <div class="panel-subtitle">Interactive Volume Viewer</div>
+
+  <div class="section">
+    <div class="section-label">Tracer</div>
+    <div id="tracer-buttons"></div>
+  </div>
+
+  <div class="section">
+    <div class="section-label">View Mode</div>
+    <button class="view-btn active" onclick="setView('volume')">Volume</button>
+    <button class="view-btn" onclick="setView('slice-x')">Slice X</button>
+    <button class="view-btn" onclick="setView('slice-y')">Slice Y</button>
+    <button class="view-btn" onclick="setView('slice-z')">Slice Z</button>
+    <button class="view-btn" onclick="setView('iso')">Isosurface</button>
+  </div>
+
+  <div class="section">
+    <div class="section-label">Controls</div>
+    <div class="slider-row">
+      <label>Opacity</label>
+      <input type="range" id="opacity" min="0" max="100" value="60"
+             oninput="updateOpacity(this.value)">
+      <span class="slider-val" id="opacity-val">0.6</span>
+    </div>
+    <div class="slider-row">
+      <label>Slice Pos</label>
+      <input type="range" id="slice-pos" min="0" max="100" value="50"
+             oninput="updateSlice(this.value)">
+      <span class="slider-val" id="slice-val">50%</span>
+    </div>
+    <div class="slider-row">
+      <label>Iso Level</label>
+      <input type="range" id="iso-level" min="0" max="100" value="50"
+             oninput="updateIso(this.value)">
+      <span class="slider-val" id="iso-val">50%</span>
+    </div>
+    <div class="slider-row">
+      <label>Brightness</label>
+      <input type="range" id="brightness" min="0" max="200" value="100"
+             oninput="updateBrightness(this.value)">
+      <span class="slider-val" id="bright-val">1.0</span>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-label">Presets</div>
+    <button class="view-btn" onclick="loadPreset('density')">Density</button>
+    <button class="view-btn" onclick="loadPreset('chemistry')">Chemistry</button>
+    <button class="view-btn" onclick="loadPreset('dust')">Dust Evo</button>
+    <button class="view-btn" onclick="loadPreset('emission')">Emission</button>
+  </div>
+</div>
+
+<div id="info">
+  Drag to rotate · Scroll to zoom · Click cell for values
+</div>
+
+<div id="colorbar"></div>
+<div id="colorbar-label"></div>
+<div id="colorbar-range"><span id="cb-min"></span><span id="cb-max"></span></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+
+<script>
+// ============================================================
+// PRISM-3D Interactive Volume Viewer
+// ============================================================
+
+// --- Demo data generation (replaced by actual model data in production) ---
+const N = 16;
+function generateDemoData() {
+  const data = {};
+  const tracers = {
+    'n_H': { label: 'Density [cm⁻³]', cmap: 'viridis', log: true },
+    'T_gas': { label: 'Temperature [K]', cmap: 'inferno', log: true },
+    'G0': { label: 'FUV Field [Habing]', cmap: 'magma', log: true },
+    'x_H2': { label: 'H₂ Fraction', cmap: 'blues', log: false },
+    'x_Cp': { label: 'C⁺ Abundance', cmap: 'reds', log: true },
+    'x_CO': { label: 'CO Abundance', cmap: 'greens', log: true },
+    'f_nano': { label: 'Nano-grain Fraction', cmap: 'rdylgn', log: false },
+    'T_dust': { label: 'Dust Temperature [K]', cmap: 'hot', log: false },
+    'Gamma_PE': { label: 'PE Heating', cmap: 'hot', log: true },
+  };
+
+  // Generate fractal turbulent density
+  for (const [key, meta] of Object.entries(tracers)) {
+    const arr = new Float32Array(N * N * N);
+    for (let ix = 0; ix < N; ix++) {
+      for (let iy = 0; iy < N; iy++) {
+        for (let iz = 0; iz < N; iz++) {
+          const idx = ix * N * N + iy * N + iz;
+          const x = ix / N, y = iy / N, z = iz / N;
+
+          // Turbulent-ish structure
+          const turb = Math.sin(x*12) * Math.cos(y*8) * Math.sin(z*10)
+                     + 0.5 * Math.sin(x*5+y*7) * Math.cos(z*6)
+                     + 0.3 * Math.sin(x*20) * Math.sin(y*15+z*12);
+
+          switch(key) {
+            case 'n_H':
+              arr[idx] = Math.exp(5.5 + 2.0 * turb); // 100-10000 cm-3
+              break;
+            case 'T_gas':
+              const av_proxy = x * 3;
+              arr[idx] = 50 + 5000 * Math.exp(-av_proxy) * (1 + 0.3 * turb);
+              break;
+            case 'G0':
+              arr[idx] = 500 * Math.exp(-1.8 * x * 4) * (1 + 0.2 * turb);
+              break;
+            case 'x_H2':
+              arr[idx] = 0.5 / (1 + Math.exp(-(x * 8 - 3 + turb)));
+              break;
+            case 'x_Cp':
+              arr[idx] = 1.4e-4 / (1 + Math.exp((x * 8 - 4 + turb)));
+              break;
+            case 'x_CO':
+              arr[idx] = 1.4e-4 / (1 + Math.exp(-(x * 8 - 5 + turb)));
+              break;
+            case 'f_nano':
+              arr[idx] = 0.7 + 0.3 * Math.exp(-x * 2) * (1 + 0.1 * turb);
+              break;
+            case 'T_dust':
+              arr[idx] = 15 + 40 * Math.exp(-x * 3) * (1 + 0.1 * turb);
+              break;
+            case 'Gamma_PE':
+              const g0_loc = 500 * Math.exp(-1.8 * x * 4);
+              const n_loc = Math.exp(5.5 + 2.0 * turb);
+              arr[idx] = 1e-24 * g0_loc * n_loc * 0.03;
+              break;
+          }
+        }
+      }
+    }
+    data[key] = { values: arr, ...meta };
+  }
+  return data;
+}
+
+// --- Colormaps ---
+const COLORMAPS = {
+  viridis: [[68,1,84],[72,36,117],[65,68,135],[53,95,141],[42,120,142],
+            [33,145,140],[34,168,132],[68,190,112],[122,209,81],[189,223,38],[253,231,37]],
+  inferno: [[0,0,4],[22,11,57],[66,10,104],[106,23,110],[147,38,103],
+            [186,54,85],[221,81,58],[243,118,27],[252,165,10],[246,215,70],[252,255,164]],
+  magma:   [[0,0,4],[18,13,49],[51,16,104],[90,17,126],[130,26,121],
+            [170,43,107],[205,70,82],[231,109,56],[246,158,47],[252,210,79],[252,253,191]],
+  blues:   [[247,251,255],[222,235,247],[198,219,239],[158,202,225],[107,174,214],
+            [66,146,198],[33,113,181],[8,81,156],[8,48,107],[3,19,43],[1,5,20]],
+  reds:    [[255,245,240],[254,224,210],[252,187,161],[252,146,114],[251,106,74],
+            [239,59,44],[203,24,29],[165,15,21],[103,0,13],[60,0,8],[30,0,4]],
+  greens:  [[247,252,245],[229,245,224],[199,233,192],[161,217,155],[116,196,118],
+            [65,171,93],[35,139,69],[0,109,44],[0,68,27],[0,40,15],[0,20,8]],
+  rdylgn:  [[165,0,38],[215,48,39],[244,109,67],[253,174,97],[254,224,139],
+            [255,255,191],[217,239,139],[166,217,106],[102,189,99],[26,152,80],[0,104,55]],
+  hot:     [[0,0,0],[30,0,0],[80,0,0],[150,0,0],[200,30,0],
+            [230,80,0],[255,140,0],[255,200,0],[255,240,100],[255,255,200],[255,255,255]],
+};
+
+function sampleColormap(name, t) {
+  const cm = COLORMAPS[name] || COLORMAPS.viridis;
+  t = Math.max(0, Math.min(1, t));
+  const idx = t * (cm.length - 1);
+  const i0 = Math.floor(idx);
+  const i1 = Math.min(i0 + 1, cm.length - 1);
+  const f = idx - i0;
+  return [
+    cm[i0][0] * (1-f) + cm[i1][0] * f,
+    cm[i0][1] * (1-f) + cm[i1][1] * f,
+    cm[i0][2] * (1-f) + cm[i1][2] * f,
+  ];
+}
+
+// --- State ---
+let modelData = generateDemoData();
+let currentTracer = 'n_H';
+let viewMode = 'volume';
+let opacityScale = 0.6;
+let slicePosition = 0.5;
+let isoLevel = 0.5;
+let brightnessScale = 1.0;
+
+// --- Three.js setup ---
+const container = document.getElementById('canvas-container');
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 100);
+camera.position.set(2.5, 2, 2.5);
+camera.lookAt(0, 0, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setClearColor(0x0a0a0f);
+container.appendChild(renderer.domElement);
+
+// Lights
+scene.add(new THREE.AmbientLight(0x404050, 0.5));
+const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+dirLight.position.set(3, 5, 3);
+scene.add(dirLight);
+
+// Axes helper
+const axes = new THREE.AxesHelper(0.6);
+scene.add(axes);
+
+// Grid
+const gridHelper = new THREE.GridHelper(2, 10, 0x1a2a3a, 0x0a1520);
+gridHelper.position.y = -0.5;
+scene.add(gridHelper);
+
+// Bounding box
+const boxGeo = new THREE.BoxGeometry(1, 1, 1);
+const boxEdges = new THREE.EdgesGeometry(boxGeo);
+const boxLine = new THREE.LineSegments(boxEdges, new THREE.LineBasicMaterial({
+  color: 0x2a4a6a, transparent: true, opacity: 0.5
+}));
+scene.add(boxLine);
+
+// --- Volume rendering with instanced cubes ---
+let volumeGroup = new THREE.Group();
+scene.add(volumeGroup);
+
+function buildVolume() {
+  // Remove old
+  while (volumeGroup.children.length > 0) {
+    const child = volumeGroup.children[0];
+    volumeGroup.remove(child);
+    if (child.geometry) child.geometry.dispose();
+    if (child.material) child.material.dispose();
+  }
+
+  const tracer = modelData[currentTracer];
+  if (!tracer) return;
+
+  const values = tracer.values;
+  const useLog = tracer.log;
+  const cmap = tracer.cmap;
+
+  // Compute range
+  let vmin = Infinity, vmax = -Infinity;
+  for (let i = 0; i < values.length; i++) {
+    const v = useLog ? Math.log10(Math.max(values[i], 1e-30)) : values[i];
+    if (isFinite(v)) {
+      vmin = Math.min(vmin, v);
+      vmax = Math.max(vmax, v);
+    }
+  }
+  if (vmax <= vmin) vmax = vmin + 1;
+
+  // Update colorbar
+  updateColorbar(tracer.label, vmin, vmax, cmap, useLog);
+
+  const cellSize = 1.0 / N;
+  const halfCell = cellSize * 0.48;
+
+  if (viewMode === 'volume') {
+    // Volume: all cells as semi-transparent cubes
+    const geo = new THREE.BoxGeometry(cellSize * 0.95, cellSize * 0.95, cellSize * 0.95);
+
+    for (let ix = 0; ix < N; ix++) {
+      for (let iy = 0; iy < N; iy++) {
+        for (let iz = 0; iz < N; iz++) {
+          const idx = ix * N * N + iy * N + iz;
+          const raw = values[idx];
+          const v = useLog ? Math.log10(Math.max(raw, 1e-30)) : raw;
+          const t = (v - vmin) / (vmax - vmin);
+
+          const [r, g, b] = sampleColormap(cmap, t);
+          const alpha = t * opacityScale * brightnessScale;
+
+          if (alpha < 0.01) continue;
+
+          const mat = new THREE.MeshLambertMaterial({
+            color: new THREE.Color(r/255, g/255, b/255),
+            transparent: true,
+            opacity: Math.min(alpha, 0.95),
+            depthWrite: false,
+          });
+
+          const mesh = new THREE.Mesh(geo, mat);
+          mesh.position.set(
+            (ix + 0.5) / N - 0.5,
+            (iy + 0.5) / N - 0.5,
+            (iz + 0.5) / N - 0.5
+          );
+          volumeGroup.add(mesh);
+        }
+      }
+    }
+  } else if (viewMode.startsWith('slice')) {
+    // Slice view
+    const axis = viewMode === 'slice-x' ? 0 : viewMode === 'slice-y' ? 1 : 2;
+    const sliceIdx = Math.floor(slicePosition * (N - 1));
+    const geo = new THREE.PlaneGeometry(cellSize * 0.95, cellSize * 0.95);
+
+    for (let a = 0; a < N; a++) {
+      for (let b = 0; b < N; b++) {
+        let ix, iy, iz;
+        if (axis === 0) { ix = sliceIdx; iy = a; iz = b; }
+        else if (axis === 1) { ix = a; iy = sliceIdx; iz = b; }
+        else { ix = a; iy = b; iz = sliceIdx; }
+
+        const idx = ix * N * N + iy * N + iz;
+        const raw = values[idx];
+        const v = useLog ? Math.log10(Math.max(raw, 1e-30)) : raw;
+        const t = (v - vmin) / (vmax - vmin);
+        const [r, g, b2] = sampleColormap(cmap, t);
+
+        const mat = new THREE.MeshBasicMaterial({
+          color: new THREE.Color(r/255, g/255, b2/255),
+          side: THREE.DoubleSide,
+        });
+        const mesh = new THREE.Mesh(geo, mat);
+
+        if (axis === 0) {
+          mesh.rotation.y = Math.PI / 2;
+          mesh.position.set((sliceIdx + 0.5)/N - 0.5, (a+0.5)/N-0.5, (b+0.5)/N-0.5);
+        } else if (axis === 1) {
+          mesh.rotation.x = Math.PI / 2;
+          mesh.position.set((a+0.5)/N-0.5, (sliceIdx+0.5)/N-0.5, (b+0.5)/N-0.5);
+        } else {
+          mesh.position.set((a+0.5)/N-0.5, (b+0.5)/N-0.5, (sliceIdx+0.5)/N-0.5);
+        }
+        volumeGroup.add(mesh);
+      }
+    }
+  } else if (viewMode === 'iso') {
+    // Isosurface: show only cells near the threshold
+    const threshold = vmin + isoLevel * (vmax - vmin);
+    const width = (vmax - vmin) * 0.08;
+    const geo = new THREE.BoxGeometry(cellSize * 0.95, cellSize * 0.95, cellSize * 0.95);
+
+    for (let ix = 0; ix < N; ix++) {
+      for (let iy = 0; iy < N; iy++) {
+        for (let iz = 0; iz < N; iz++) {
+          const idx = ix * N * N + iy * N + iz;
+          const raw = values[idx];
+          const v = useLog ? Math.log10(Math.max(raw, 1e-30)) : raw;
+
+          if (Math.abs(v - threshold) > width) continue;
+
+          const t = (v - vmin) / (vmax - vmin);
+          const [r, g, b] = sampleColormap(cmap, t);
+          const mat = new THREE.MeshLambertMaterial({
+            color: new THREE.Color(r/255, g/255, b/255),
+            transparent: true,
+            opacity: 0.85,
+          });
+          const mesh = new THREE.Mesh(geo, mat);
+          mesh.position.set((ix+0.5)/N-0.5, (iy+0.5)/N-0.5, (iz+0.5)/N-0.5);
+          volumeGroup.add(mesh);
+        }
+      }
+    }
+  }
+}
+
+function updateColorbar(label, vmin, vmax, cmapName, useLog) {
+  const bar = document.getElementById('colorbar');
+  const stops = [];
+  for (let i = 0; i <= 10; i++) {
+    const [r, g, b] = sampleColormap(cmapName, i / 10);
+    stops.push(`rgb(${r|0},${g|0},${b|0}) ${i*10}%`);
+  }
+  bar.style.background = `linear-gradient(to right, ${stops.join(',')})`;
+  document.getElementById('colorbar-label').textContent = label;
+  const fmt = (v) => useLog ? `10^${v.toFixed(1)}` : v.toPrecision(3);
+  document.getElementById('cb-min').textContent = fmt(vmin);
+  document.getElementById('cb-max').textContent = fmt(vmax);
+}
+
+// --- Orbit controls (manual) ---
+let isDragging = false;
+let prevMouse = { x: 0, y: 0 };
+let spherical = { theta: Math.PI / 4, phi: Math.PI / 4, radius: 3 };
+
+function updateCamera() {
+  camera.position.x = spherical.radius * Math.sin(spherical.phi) * Math.cos(spherical.theta);
+  camera.position.y = spherical.radius * Math.cos(spherical.phi);
+  camera.position.z = spherical.radius * Math.sin(spherical.phi) * Math.sin(spherical.theta);
+  camera.lookAt(0, 0, 0);
+}
+
+renderer.domElement.addEventListener('mousedown', (e) => {
+  isDragging = true;
+  prevMouse = { x: e.clientX, y: e.clientY };
+});
+
+renderer.domElement.addEventListener('mousemove', (e) => {
+  if (!isDragging) return;
+  const dx = e.clientX - prevMouse.x;
+  const dy = e.clientY - prevMouse.y;
+  spherical.theta -= dx * 0.005;
+  spherical.phi = Math.max(0.1, Math.min(Math.PI - 0.1, spherical.phi - dy * 0.005));
+  prevMouse = { x: e.clientX, y: e.clientY };
+  updateCamera();
+});
+
+renderer.domElement.addEventListener('mouseup', () => isDragging = false);
+renderer.domElement.addEventListener('mouseleave', () => isDragging = false);
+
+renderer.domElement.addEventListener('wheel', (e) => {
+  spherical.radius *= e.deltaY > 0 ? 1.1 : 0.9;
+  spherical.radius = Math.max(1, Math.min(10, spherical.radius));
+  updateCamera();
+  e.preventDefault();
+}, { passive: false });
+
+// Touch support
+renderer.domElement.addEventListener('touchstart', (e) => {
+  isDragging = true;
+  prevMouse = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+});
+renderer.domElement.addEventListener('touchmove', (e) => {
+  if (!isDragging || !e.touches[0]) return;
+  const dx = e.touches[0].clientX - prevMouse.x;
+  const dy = e.touches[0].clientY - prevMouse.y;
+  spherical.theta -= dx * 0.005;
+  spherical.phi = Math.max(0.1, Math.min(Math.PI - 0.1, spherical.phi - dy * 0.005));
+  prevMouse = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+  updateCamera();
+  e.preventDefault();
+}, { passive: false });
+renderer.domElement.addEventListener('touchend', () => isDragging = false);
+
+// --- UI callbacks ---
+function setTracer(name) {
+  currentTracer = name;
+  document.querySelectorAll('.tracer-btn').forEach(b =>
+    b.classList.toggle('active', b.dataset.tracer === name));
+  buildVolume();
+}
+
+function setView(mode) {
+  viewMode = mode;
+  document.querySelectorAll('.view-btn').forEach(b =>
+    b.classList.toggle('active', false));
+  // Highlight matching button
+  event.target.classList.add('active');
+  buildVolume();
+}
+
+function updateOpacity(val) {
+  opacityScale = val / 100;
+  document.getElementById('opacity-val').textContent = opacityScale.toFixed(2);
+  buildVolume();
+}
+
+function updateSlice(val) {
+  slicePosition = val / 100;
+  document.getElementById('slice-val').textContent = Math.round(val) + '%';
+  if (viewMode.startsWith('slice')) buildVolume();
+}
+
+function updateIso(val) {
+  isoLevel = val / 100;
+  document.getElementById('iso-val').textContent = Math.round(val) + '%';
+  if (viewMode === 'iso') buildVolume();
+}
+
+function updateBrightness(val) {
+  brightnessScale = val / 100;
+  document.getElementById('bright-val').textContent = brightnessScale.toFixed(1);
+  buildVolume();
+}
+
+function loadPreset(name) {
+  switch(name) {
+    case 'density':
+      setTracer('n_H'); viewMode = 'volume'; opacityScale = 0.5; break;
+    case 'chemistry':
+      setTracer('x_H2'); viewMode = 'volume'; opacityScale = 0.7; break;
+    case 'dust':
+      setTracer('f_nano'); viewMode = 'volume'; opacityScale = 0.8; break;
+    case 'emission':
+      setTracer('Gamma_PE'); viewMode = 'volume'; opacityScale = 0.6; break;
+  }
+  buildVolume();
+}
+
+// --- Build tracer buttons ---
+const btnContainer = document.getElementById('tracer-buttons');
+for (const [key, meta] of Object.entries(modelData)) {
+  const btn = document.createElement('button');
+  btn.className = 'tracer-btn' + (key === currentTracer ? ' active' : '');
+  btn.textContent = meta.label.split(' ')[0].replace('[', '').replace(']', '');
+  btn.dataset.tracer = key;
+  btn.onclick = () => setTracer(key);
+  btnContainer.appendChild(btn);
+}
+
+// --- Animation loop ---
+function animate() {
+  requestAnimationFrame(animate);
+  // Gentle auto-rotation when not dragging
+  if (!isDragging) {
+    spherical.theta += 0.001;
+    updateCamera();
+  }
+  renderer.render(scene, camera);
+}
+
+// --- Resize ---
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// --- Init ---
+updateCamera();
+buildVolume();
+animate();
+</script>
+</body>
+</html>

@@ -1,0 +1,54 @@
+Bootstrap: docker
+From: python:3.11-slim
+
+%labels
+    Author PRISM-3D Team
+    Version 0.5
+    Description 3D PDR code with THEMIS dust evolution and ML-accelerated chemistry
+
+%post
+    apt-get update && apt-get install -y --no-install-recommends \
+        gcc g++ gfortran libhdf5-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+    pip install --no-cache-dir \
+        numpy scipy matplotlib scikit-learn \
+        astropy astroquery h5py
+
+    mkdir -p /opt/prism3d
+    
+%files
+    prism3d /opt/prism3d/prism3d
+    pyproject.toml /opt/prism3d/pyproject.toml
+
+%post
+    cd /opt/prism3d && pip install --no-cache-dir -e .
+
+%environment
+    export PYTHONPATH=/opt/prism3d:$PYTHONPATH
+    export PRISM3D_HOME=/opt/prism3d
+
+%runscript
+    exec python -m prism3d.run "$@"
+
+%test
+    python -c "from prism3d.solver_3d import PDRSolver3D; print('PRISM-3D OK')"
+
+%help
+    PRISM-3D v0.5 — 3D PDR code with THEMIS dust evolution.
+
+    Run a model:
+      apptainer run prism3d.sif --n 32 --G0 1000 --output ./results
+
+    Run with config:
+      apptainer run prism3d.sif --config model.json
+
+    Orion Bar preset:
+      apptainer run prism3d.sif --orion-bar --n 64
+
+    Train ML accelerator:
+      apptainer exec prism3d.sif python -m prism3d.chemistry.train_hpc \
+          --n-samples 50000 --output training.npz
+
+    Interactive shell:
+      apptainer shell prism3d.sif
