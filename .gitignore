@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# ML accelerator artifacts
+accelerator_*.pkl
+
+# Run results
+results/
+
+# Apptainer / Singularity images
+*.sif
+
+# Editors
+*.swp
+*.swo
+*~
+.vscode/
+.idea/

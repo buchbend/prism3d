@@ -6,9 +6,16 @@
 PYTHON ?= python3
 N ?= 16
 G0 ?= 500
+N_MEAN ?= 500
+BOX ?= 2.0
 OUTPUT ?= ./results
-CONTAINER ?= prism3d.sif
+MAX_ITER ?= 20
+DUST_STEPS ?= 5
+CONTAINER ?= ../prism3d.sif
+ACCELERATOR ?=
 TRAIN_SAMPLES ?= 50000
+TRAIN_CPUS ?= 16
+TRAIN_WALLTIME ?= 08:00:00
 
 help:
 	@echo "PRISM-3D v0.5 — 3D PDR with THEMIS Dust Evolution"
@@ -19,19 +26,22 @@ help:
 	@echo "  make run             Run model (N=$(N), G0=$(G0))"
 	@echo "  make run-orion       Run Orion Bar preset"
 	@echo "  make run-horsehead   Run Horsehead preset"
-	@echo "  make train           Train ML accelerator ($(TRAIN_SAMPLES) samples)"
-	@echo "  make train-container Train ML accelerator inside container"
+	@echo "  make container-run   Run inside Apptainer container"
+	@echo "  make container-train Train ML accelerator in container"
+	@echo "  make train           Train ML accelerator locally"
 	@echo "  make data            Download PDRs4All Orion Bar data"
 	@echo "  make container       Build Apptainer/Singularity container"
 	@echo "  make slurm           Generate SLURM submission scripts"
-	@echo "  make slurm-train-container  SLURM script for container training"
 	@echo "  make clean           Remove build artifacts"
 	@echo ""
 	@echo "Variables:"
 	@echo "  N=32                 Grid cells per dimension"
 	@echo "  G0=1000              External FUV field [Habing]"
 	@echo "  OUTPUT=./results     Output directory"
+	@echo "  ACCELERATOR=         Path to trained accelerator .pkl"
 	@echo "  TRAIN_SAMPLES=50000  ML training samples"
+	@echo "  TRAIN_CPUS=16        Worker cores for training"
+	@echo "  TRAIN_WALLTIME=08:00:00  SLURM wall time"
 
 # ── Installation ──────────────────────────────────────────
 
@@ -51,7 +61,10 @@ test:
 	@echo "Test complete. Check ./test_output/"
 
 run:
-	$(PYTHON) -m prism3d.run --n $(N) --G0 $(G0) --output $(OUTPUT)
+	$(PYTHON) -m prism3d.run --n $(N) --G0 $(G0) --n-mean $(N_MEAN) \
+		--box $(BOX) --max-iter $(MAX_ITER) \
+		--dust-steps $(DUST_STEPS) --output $(OUTPUT) \
+		$(if $(ACCELERATOR),--accelerator $(ACCELERATOR))
 
 run-orion:
 	$(PYTHON) -m prism3d.run --orion-bar --n $(N) --output $(OUTPUT)/orion_bar
@@ -76,6 +89,7 @@ train:
 		--save accelerator_$(TRAIN_SAMPLES).pkl
 	@echo "Done. Accelerator: accelerator_$(TRAIN_SAMPLES).pkl"
 
+
 # ── Data ──────────────────────────────────────────────────
 
 data:
@@ -90,14 +104,37 @@ data-prepare:
 
 # ── Container ─────────────────────────────────────────────
 
+# Bind-mount local source so the container uses current code,
+# and bind output + accelerator into /output.
+BIND_SRC = --bind $(CURDIR):/opt/prism3d/prism3d
+BIND_OUT = --bind $(abspath $(OUTPUT)):/output
+BIND_ACC = $(if $(ACCELERATOR),--bind $(abspath $(ACCELERATOR)):/model/accelerator.pkl)
+ACC_FLAG = $(if $(ACCELERATOR),--accelerator /model/accelerator.pkl)
+
 container:
 	apptainer build $(CONTAINER) apptainer.def
 
 container-run:
-	apptainer run $(CONTAINER) --n $(N) --G0 $(G0) --output $(OUTPUT)
+	@mkdir -p $(OUTPUT)
+	apptainer exec $(BIND_SRC) $(BIND_OUT) $(BIND_ACC) $(CONTAINER) \
+		python -m prism3d.run --n $(N) --G0 $(G0) --n-mean $(N_MEAN) \
+		--box $(BOX) --max-iter $(MAX_ITER) \
+		--dust-steps $(DUST_STEPS) --output /output $(ACC_FLAG)
+
+container-train:
+	@mkdir -p $(OUTPUT)
+	apptainer exec $(BIND_SRC) $(BIND_OUT) $(CONTAINER) \
+		python -m prism3d.chemistry.train_hpc \
+		--n-samples $(TRAIN_SAMPLES) --n-workers $$(nproc) \
+		--output /output/training_data_$(TRAIN_SAMPLES).npz
+	apptainer exec $(BIND_SRC) $(BIND_OUT) $(CONTAINER) \
+		python -m prism3d.chemistry.train_hpc \
+		--train --data /output/training_data_$(TRAIN_SAMPLES).npz \
+		--save /output/accelerator_$(TRAIN_SAMPLES).pkl
+	@echo "Accelerator: $(OUTPUT)/accelerator_$(TRAIN_SAMPLES).pkl"
 
 container-shell:
-	apptainer shell $(CONTAINER)
+	apptainer shell $(BIND_SRC) $(CONTAINER)
 
 # ── SLURM ─────────────────────────────────────────────────
 
@@ -108,13 +145,13 @@ slurm:
 
 slurm-train:
 	$(PYTHON) -m prism3d.chemistry.train_hpc --gen-slurm \
-		--n-samples $(TRAIN_SAMPLES) --cpus 16 --wall-time 08:00:00
+		--n-samples $(TRAIN_SAMPLES) --cpus $(TRAIN_CPUS) --wall-time $(TRAIN_WALLTIME)
 	@echo "Submit with: sbatch train_accelerator_$(TRAIN_SAMPLES).slurm"
 
 slurm-train-container:
 	$(PYTHON) -m prism3d.chemistry.train_hpc --gen-slurm \
 		--container $(CONTAINER) \
-		--n-samples $(TRAIN_SAMPLES) --cpus 16 --wall-time 08:00:00 \
+		--n-samples $(TRAIN_SAMPLES) --cpus $(TRAIN_CPUS) --wall-time $(TRAIN_WALLTIME) \
 		--outdir ./train_output
 	@echo "Submit with: sbatch train_accelerator_$(TRAIN_SAMPLES).slurm"
 

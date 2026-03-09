@@ -54,7 +54,10 @@ Examples:
     # Solver
     p.add_argument('--max-iter', type=int, default=10, help='Max iterations (default: 10)')
     p.add_argument('--tol', type=float, default=0.05, help='Convergence tolerance')
+    p.add_argument('--dust-steps', type=int, default=5, help='Outer dust evolution steps (default: 5)')
     p.add_argument('--refine', action='store_true', help='Run BDF refinement pass')
+    p.add_argument('--accelerator', type=str, default=None,
+                   help='Path to trained ML accelerator .pkl file')
 
     # I/O
     p.add_argument('--output', type=str, default='./prism3d_output', help='Output directory')
@@ -109,6 +112,13 @@ def run_model(args):
     n = args.n
     box = args.box * pc_cm
 
+    # Create timestamped run directory inside the output dir
+    from datetime import datetime
+    run_id = datetime.now().strftime('%Y%m%d_%H%M%S')
+    run_dir = os.path.join(args.output, f"run_{run_id}")
+    os.makedirs(run_dir, exist_ok=True)
+    args.output = run_dir
+
     print(f"\n{'='*60}")
     print(f"  PRISM-3D v0.5 — 3D PDR with THEMIS Dust Evolution")
     print(f"{'='*60}")
@@ -135,8 +145,14 @@ def run_model(args):
         zeta_CR_0=args.zeta_cr,
         nside_rt=args.nside
     )
+    if args.accelerator:
+        from prism3d.chemistry.accelerator import ChemistryAccelerator
+        solver.accelerator = ChemistryAccelerator.load(args.accelerator)
+        print(f"ML accelerator loaded: {args.accelerator}")
+
     solver.run(max_iterations=args.max_iter,
-               convergence_tol=args.tol, verbose=True)
+               convergence_tol=args.tol,
+               dust_steps=args.dust_steps, verbose=True)
 
     if args.refine:
         solver.refine(verbose=True)

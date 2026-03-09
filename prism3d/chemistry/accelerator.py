@@ -384,15 +384,27 @@ class ChemistryAccelerator:
         # Batch conservation enforcement
         from ..utils.constants import gas_phase_abundances
         x_C_total = gas_phase_abundances.get('C', 1.4e-4)
-        
-        # Carbon conservation
+        x_O_total = gas_phase_abundances.get('O', 3.0e-4)
+
+        # H conservation: x_H + 2*x_H2 = 1
+        H_sum = result['H'] + 2 * result['H2']
+        h_mask = H_sum > 0
+        h_scale = np.where(h_mask, 1.0 / H_sum, 1.0)
+        result['H'] *= h_scale
+        result['H2'] *= h_scale
+
+        # Carbon conservation: x_Cp + x_C + x_CO = x_C_total
         C_sum = result['C+'] + result['C'] + result['CO']
         mask = C_sum > 0
         scale = np.where(mask, x_C_total / C_sum, 1.0)
         result['C+'] *= scale
         result['C'] *= scale
         result['CO'] *= scale
-        
+
+        # Oxygen conservation: x_O = x_O_total - x_CO - x_OH
+        result['O'] = np.maximum(
+            x_O_total - result['CO'] - result.get('OH', 0), 1e-30)
+
         # Charge balance
         result['e-'] = result['C+'] + result.get('HCO+', 0)
         

@@ -190,10 +190,13 @@ def train_from_data(data_path, model_type='gbrt', save_path=None):
 SLURM_TEMPLATE_VENV = """#!/bin/bash
 #SBATCH --job-name=prism3d_train
 #SBATCH --output=train_%j.out
+#SBATCH --error=train_%j.err
 #SBATCH --cpus-per-task={cpus}
 #SBATCH --time={wall_time}
 #SBATCH --mem={mem_gb}G
 {partition_line}
+
+set -e
 
 source $HOME/prism3d_env/bin/activate
 
@@ -216,10 +219,13 @@ echo "Finished at $(date)"
 SLURM_TEMPLATE_CONTAINER = """#!/bin/bash
 #SBATCH --job-name=prism3d_train
 #SBATCH --output=train_%j.out
+#SBATCH --error=train_%j.err
 #SBATCH --cpus-per-task={cpus}
 #SBATCH --time={wall_time}
 #SBATCH --mem={mem_gb}G
 {partition_line}
+
+set -e
 
 CONTAINER="{container}"
 OUTDIR="{outdir}"
@@ -235,6 +241,11 @@ apptainer exec --bind "$OUTDIR":/output "$CONTAINER" \\
         --n-samples {n_samples} \\
         --n-workers {cpus} \\
         --output /output/training_data_{n_samples}.npz
+
+if [ ! -f "$OUTDIR/training_data_{n_samples}.npz" ]; then
+    echo "ERROR: Phase 1 failed — training data not generated"
+    exit 1
+fi
 
 # Phase 2: Train GBRT accelerator from data
 apptainer exec --bind "$OUTDIR":/output "$CONTAINER" \\

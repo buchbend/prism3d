@@ -6,33 +6,183 @@ Deep technical reference for each subsystem. Read CLAUDE.md first for overview.
 
 ## 1. Solver Architecture (`core/solver_3d.py`, 477 lines)
 
-### Iteration Loop
-The 3D solver is a fixed-point iteration. Each iteration:
+### Two-Level Iteration
+
+The solver uses a two-level iteration that respects physical timescales:
+
+- **Outer loop** (dust evolution, slow: 10⁴–10⁶ yr timescale):
+  advances THEMIS grain state (f_nano, E_g) by one dust timestep (10 kyr),
+  then re-converges the inner loop. Default: 5 dust steps.
+
+- **Inner loop** (chemistry + thermal equilibrium, fast: 10²–10⁴ yr):
+  iterates RT → shielding → CR → PE heating → chemistry → thermal balance
+  to convergence with **fixed** dust properties.
 
 ```
-1. FUV Radiative Transfer  → G₀(x,y,z), A_V(x,y,z)
-2. H₂/CO Shielding         → f_shield_H2, f_shield_CO per cell
-3. Chemistry                → abundances (H, H₂, C⁺, C, CO, O, e⁻, OH, HCO⁺)
-4. THEMIS Dust Evolution    → f_nano, E_g per cell → Γ_PE, R_H2
-5. Thermal Balance          → T_gas per cell
-6. Dust Temperature         → T_dust per cell
-7. Convergence Check        → max(ΔT/T, Δx_H2, Δx_CO) < tol
+Outer (dust step d = 0..N_dust):
+│  Evolve dust: f_nano, E_g  (time-dependent, _evolve_dust_state)
+│
+│  Inner (iteration i = 0..N_iter):
+│  ├─ 1. FUV Radiative Transfer  → G₀(x,y,z), A_V(x,y,z)
+│  ├─ 2. H₂/CO Shielding         → f_shield_H2, f_shield_CO per cell
+│  ├─ 3. CR Attenuation           → ζ_CR(x,y,z)
+│  ├─ 4. PE Heating + T_dust      → Γ_PE, T_dust  (instantaneous, _update_dust_heating)
+│  ├─ 5. Chemistry                → abundances (ML or Euler)
+│  ├─ 6. Damping                  → mode-dependent (see below)
+│  ├─ 7. Thermal Balance          → T_gas per cell (adaptive per-cell damping)
+│  └─ 8. Convergence Check        → p99(ΔT/T, Δx_H2, Δx_CO) < tol
 ```
 
-Convergence typically in 3–6 iterations. The solver stores per-cell arrays:
+This separation is physically motivated: gas reaches chemical and thermal
+equilibrium quickly given a fixed grain population, while dust evolution
+responds slowly to the ambient radiation field. Mixing both in a single
+loop prevented convergence (dust kept changing PE heating rates).
+
+On the very first inner iteration (d=0, i=0), `_set_analytical_ic()` seeds
+position-dependent abundances from the A_V/G₀ field using tanh-profile
+approximations for the H/H₂ and C⁺/CO transitions.
+
+### Damping Strategy
+
+#### The physical problem: operator-split bistability
+
+PRISM-3D uses operator splitting: chemistry is solved at fixed T, then thermal
+balance is solved at fixed abundances. This is the standard approach in all PDR
+codes (Meudon, KOSMA-τ, 3D-PDR, Cloudy) and is mathematically a **fixed-point
+iteration** on the coupled system (T, abundances).
+
+The complication arises at the **H/H₂ dissociation front** (A_V ≈ 1.5–2.5).
+In these cells the thermal balance has two self-consistent solutions:
+
+1. **Atomic state**: x_H₂ ≈ 0, weak H₂ cooling, T ≈ 200–500 K → at this T,
+   photodissociation dominates → x_H₂ stays low ✓
+2. **Molecular state**: x_H₂ ≈ 0.5, strong H₂/CO cooling, T ≈ 30–80 K → at
+   this T, formation on grains dominates → x_H₂ stays high ✓
+
+Both are self-consistent, but operator splitting bounces between them:
+small ΔT → chemistry flips x_H₂ → cooling rate changes → T flips back.
+This is not a numerical bug — it is a genuine **physical bistability** of the
+H/H₂ transition under operator splitting. The true solution lies on the
+separatrix between the two states.
+
+In a 32³ grid with G₀=500, roughly 1500–3000 cells (~5–9%) sit at this
+transition zone. The rest of the grid converges without issue.
+
+#### Under-relaxation (damping)
+
+The standard remedy for oscillatory fixed-point iterations is
+**under-relaxation**: instead of `x_{n+1} = F(x_n)`, use
+`x_{n+1} = w × x_n + (1−w) × F(x_n)`, where `w ∈ [0, 1)`.
+The converged solution x* satisfies x* = F(x*) regardless of w —
+damping only affects the path to convergence, not the endpoint.
+
+Damping differs by chemistry mode because the ML and Euler paths have
+fundamentally different iteration behavior:
+
+- **ML path**: The accelerator predicts equilibrium abundances for a given T
+  in one shot. Damping these globally would create an inconsistent state (not
+  equilibrium for *any* T), causing thermal balance to overcorrect. Therefore:
+  **no global abundance damping; selective per-cell abundance damping only for
+  identified oscillating cells; adaptive per-cell T damping for all cells.**
+
+- **Euler path**: Chemistry is evolved incrementally via subcycled timesteps,
+  which is inherently partially damped by construction.
+  **50/50 abundance damping + 50/50 T damping** (uniform across all cells).
+
+#### Adaptive per-cell T damping
+
+A single damping factor cannot work for the whole grid: well-behaved cells
+converge best with light damping (w ≈ 0.5), while bistable cells need heavy
+damping (w → 1). The solver tracks a per-cell damping weight array `w_damp`:
+
+- Each cell starts at `w = 0.5` (50/50 blend)
+- After each thermal solve:
+  - `|ΔT/T| > 0.5` → `w += 0.15` (fast ramp: cell is oscillating)
+  - `|ΔT/T| < 0.1` → `w -= 0.02` (slow decay: cell is settling)
+- Clamped to `w ∈ [0.5, 0.98]`
+- Applied as: `T_new = w × T_old + (1−w) × T_solved`
+
+At `w = 0.98`, a persistent oscillator moves only 2% toward the new
+solution each step. Over many iterations, this converges to the
+**time-averaged state** between the two bistable solutions — which is the
+physically correct answer for the dissociation front location.
+
+The fast ramp (+0.15 per hit) ensures problematic cells are identified
+within 3 iterations. The slow decay (−0.02) keeps well-behaved cells
+responsive. This is standard practice in CFD/FEM nonlinear solvers.
+
+#### Selective abundance damping in ML mode
+
+The `w_damp` array also controls abundance damping in ML mode.
+Most cells should NOT have their ML-predicted abundances damped (the ML
+gives the correct equilibrium for the current T). But for cells already
+identified as oscillating (`w_damp > 0.55`, i.e. flagged for ≥1 iteration
+with `|ΔT/T| > 0.5`), abundances are blended with the same weight:
+
+```
+x_H₂_damped = w × x_H₂_old + (1−w) × x_H₂_ML
+```
+
+Without this, the T↔H₂ feedback loop persists: damping only T is
+insufficient because the ML predicts sharply different x_H₂ for T values
+on either side of the bistable transition (e.g. x_H₂ ≈ 0 at 300 K vs.
+x_H₂ ≈ 0.45 at 60 K). Damping T slows the T oscillation but does not
+break the chemistry jump. Damping both T and abundances together for the
+same cells freezes the coupled oscillation.
+
+Well-behaved cells (~92–95% of the grid) remain completely undamped.
+
+### Convergence Metric
+
+The solver reports three quantities per iteration:
+- `dT`: relative temperature change (95th percentile)
+- `dH2`: relative H₂ change (99th percentile, floor 0.01 in denominator)
+- `dCO`: relative CO change (99th percentile, floor 1e-6 in denominator)
+
+Convergence is declared when `max(dT, dH2, dCO) < tol` (default tol = 0.05).
+
+**Why p95 for T but p99 for chemistry**: The ~5% of cells at the dissociation
+front are genuinely bistable under operator splitting. Their T oscillation is
+a consequence of the numerical method (operator splitting), not a failure to
+find the right answer — the spatially-averaged position of the front IS
+well-determined. Using p99 for T would require these cells to fully settle,
+which demands very heavy damping (w > 0.99) and many iterations for marginal
+benefit. At p95, convergence means 95% of the grid has ΔT/T < 5%, which is
+sufficient for all downstream quantities (line emission, dust evolution).
+
+Chemistry (dH2, dCO) uses p99 because the abundance damping in ML mode
+effectively freezes the oscillating cells — their dH2 contribution is
+suppressed by the per-cell damping, so the p99 reflects real convergence.
+
+**Denominator floors**: The relative change |Δx|/x diverges when x is near
+zero (e.g. x_H₂ = 10⁻⁶ in fully atomic gas). Floors of 0.01 for H₂ and
+10⁻⁶ for CO prevent these irrelevant cells from dominating the metric. A cell
+going from x_H₂ = 0.001 → 0.002 registers as |Δ|/0.01 = 0.1, not |Δ|/0.001 = 1.
+
+The log additionally reports:
+- `dT(p99)`: the 99th percentile of ΔT/T (for monitoring the front cells)
+- `max(dT)`: absolute worst cell
+- `n_osc`: count of cells with |ΔT/T| > tol (should plateau, not grow)
+
+Inner convergence typically in 5–15 iterations. The solver stores per-cell arrays:
 - `density`, `T_gas`, `T_dust` — shape (nx, ny, nz)
 - `x_H2`, `x_HI`, `x_Cp`, `x_C`, `x_CO`, `x_O`, `x_e`, `x_OH`, `x_HCOp` — abundances
 - `G0`, `A_V` — FUV field and visual extinction
 - `f_nano`, `E_g`, `Gamma_PE` — THEMIS dust state
 
 ### Chemistry Modes
-Three modes selected automatically:
-1. **ML Accelerator** (default): GBRT prediction, 0.046 ms/cell batch. Used for >99% of cells.
-2. **Explicit Euler** (fallback): 5 ms/cell. Used when ML model unavailable.
-3. **BDF** (`refine=True`): 500 ms/cell. Used for accuracy refinement pass.
+Three modes, selected by `--accelerator` flag and `--refine`:
+1. **ML Accelerator** (`--accelerator path.pkl`): GBRT prediction, 0.046 ms/cell batch.
+   Predicts equilibrium abundances in one shot from (n, T, G₀, A_V, ζ, f_sh).
+   Conservation enforced in `predict_batch()`. Requires a trained `.pkl` file
+   (train with `make container-train`).
+2. **Explicit Euler** (default, no accelerator): 200 subcycled substeps per inner
+   iteration. Adaptive per-cell timestep with 10% rate limiter. Enforces H and C
+   conservation after each substep. Convergence check every 20 substeps for early exit.
+3. **BDF** (`--refine`): `scipy.integrate.solve_ivp` with BDF, 500 ms/cell.
+   Post-convergence refinement pass for maximum accuracy.
 
-Chemistry is the bottleneck for BDF but negligible (<1%) with ML accelerator.
-With ML, the thermal solver (Python Brent loops) becomes the bottleneck at 19%.
+With ML, the thermal solver (vectorized bisection) becomes the bottleneck.
 
 ### Save/Load
 `solver.save('model.npz')` and `PDRSolver3D.load('model.npz')` serialize all
@@ -74,12 +224,17 @@ The WD01 fit: ε_PE = 0.049 / (1 + (γ/1925)^0.73) + 0.037 × (T/10⁴)^0.7 / (1
 Multiplied by f_nano for the nano-grain contribution.
 
 ### UV Evolution
-Per iteration, the solver updates f_nano:
+Dust state evolves in the **outer loop** only (`_evolve_dust_state`):
 - **Photo-destruction**: df/dt = -f / τ_destr, τ = 10⁴ yr × (10⁴/G₀)
 - **Aromatization**: E_g decreases (→ 0.1 eV) under UV exposure
 - **Replenishment**: accretion in dense gas, df/dt = (1-f) × n_H / n_crit
 
-The 3D solver applies a 10 kyr timestep per iteration.
+Each outer step advances by dt = 10 kyr. Between dust steps, the inner
+loop converges chemistry and thermal balance with fixed f_nano/E_g.
+
+PE heating and T_dust are **instantaneous** quantities recomputed every
+inner iteration (`_update_dust_heating`) — they depend on the current
+electron density and temperature, not on dust evolution timescales.
 
 ---
 
@@ -291,7 +446,14 @@ Auto-detects GPU availability and uses CUDA kernel if present.
 
 | Choice | Reason |
 |--------|--------|
-| Explicit Euler for chemistry default | 10× faster than BDF, acceptable for initial convergence |
+| Two-level iteration (dust outer, chem+thermal inner) | Respects physical timescales; single-loop mixing prevented convergence |
+| Analytical IC from A_V/G₀ | Seeds near-equilibrium abundances; uniform IC left chemistry flat |
+| H + C conservation enforcement per substep | `np.maximum` clipping breaks conservation; explicit rescaling required |
+| Adaptive per-cell damping w ∈ [0.5, 0.98] | Bistable front cells need heavy damping; well-behaved cells need light |
+| Selective ML abundance damping (w > 0.55 only) | Undamped ML abundances are correct; only oscillating cells need blending |
+| p95 for T convergence, p99 for chemistry | ~5% of cells at dissociation front are genuinely bistable under operator splitting |
+| Denominator floors (H₂: 0.01, CO: 1e-6) | Prevents near-zero cells from inflating relative change metric |
+| Explicit Euler for chemistry default | 10× faster than BDF, acceptable with good IC and 200 substeps |
 | ML accelerator as primary | 10⁴× faster, makes 3D feasible on laptops |
 | Escape probability for line maps | Standard in PDR codes, O(N) per cell, handles optically thick lines |
 | Formal solution for PPV cubes | Exact per-channel, captures self-absorption profile shapes |
