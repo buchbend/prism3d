@@ -67,6 +67,12 @@ Examples:
     # Presets
     p.add_argument('--orion-bar', action='store_true', help='Use Orion Bar preset')
     p.add_argument('--horsehead', action='store_true', help='Use Horsehead preset')
+    p.add_argument('--blowout', action='store_true',
+                   help='O star blowout: embedded star breaking out of natal cloud')
+
+    # Velocity field
+    p.add_argument('--no-velocity', action='store_true',
+                   help='Skip velocity field generation (static model)')
 
     # HPC
     p.add_argument('--gen-slurm', action='store_true', help='Generate SLURM script and exit')
@@ -87,18 +93,28 @@ def run_model(args):
 
     # Apply presets
     if args.orion_bar:
-        args.G0 = 20000
+        args.G0 = 26000
         args.n_mean = 50000
         args.box = 0.4
         args.sigma_ln = 0.8
         args.nside = 2
-        print("Using Orion Bar preset: G0=2e4, n=5e4, box=0.4 pc")
+        args._orion_bar = True
+        print("Using Orion Bar preset: G0=2.6e4 (directional), "
+              "P/k=1e8, box=0.4 pc, incl=4°")
     elif args.horsehead:
         args.G0 = 100
         args.n_mean = 2000
         args.box = 0.5
         args.sigma_ln = 1.0
         print("Using Horsehead preset: G0=100, n=2e3, box=0.5 pc")
+    elif args.blowout:
+        args.box = 3.0
+        args.n_mean = 3000
+        args.sigma_ln = 1.2
+        args.nside = 1
+        args._blowout = True
+        print("Using Blowout preset: O5V star, n=3e3, box=3 pc, "
+              "point-source RT")
 
     # Load config file if given
     if args.config:
@@ -132,18 +148,62 @@ def run_model(args):
     print(f"{'='*60}\n")
 
     # Generate density field
-    density, cs = fractal_turbulent(
-        n, box, n_mean=args.n_mean,
-        sigma_ln=args.sigma_ln, seed=args.seed
-    )
+    use_orion = getattr(args, '_orion_bar', False)
+    use_blowout = getattr(args, '_blowout', False)
+    star = None
+
+    if use_orion:
+        from prism3d.examples.orion_bar_3d import orion_bar_density
+        density, cs = orion_bar_density(n, box)
+    elif use_blowout:
+        from prism3d.density_fields import embedded_star_cloud
+        from prism3d.utils.constants import Lsun_erg
+        density, cs, star_pos = embedded_star_cloud(
+            n, box, n_cloud=args.n_mean, sigma_ln=args.sigma_ln,
+            seed=args.seed,
+        )
+        L_FUV = 0.3 * 2e5 * Lsun_erg  # O5V
+        star = {'position': star_pos, 'L_FUV': L_FUV}
+        G0_wall = L_FUV / (4 * np.pi * (0.15 * box)**2 * 1.6e-3)
+        print(f"  Point source: O5V, L_FUV = {L_FUV/Lsun_erg:.0e} L_sun")
+        print(f"  G₀ at cavity wall: {G0_wall:.0f} Habing")
+    else:
+        density, cs = fractal_turbulent(
+            n, box, n_mean=args.n_mean,
+            sigma_ln=args.sigma_ln, seed=args.seed
+        )
+
+    # Generate velocity field (skip for structured presets)
+    vel_field = None
+    if not args.no_velocity and not use_orion and not use_blowout:
+        from prism3d.density_fields import turbulent_velocity_field
+        vel_field = turbulent_velocity_field(
+            n, box, density, sigma_ln=args.sigma_ln,
+            seed=args.seed
+        )
+
+    # Set up G0: directional for Orion Bar, point-source for blowout,
+    # isotropic otherwise
+    G0_input = args.G0
+    if use_orion:
+        from prism3d.radiative_transfer.fuv_rt_3d import directional_G0
+        G0_input = directional_G0(
+            args.G0, source_direction=[-1.0, 0.0, 0.0], nside=args.nside
+        )
+        print(f"  Directional G₀: {np.min(G0_input):.0f}–{np.max(G0_input):.0f} "
+              f"({12*args.nside**2} rays)")
+    elif use_blowout:
+        G0_input = 1.0  # Weak background ISRF; star handled by point-source RT
 
     # Create and run solver
     t0 = time.time()
     solver = PDRSolver3D(
         density, box,
-        G0_external=args.G0,
+        G0_external=G0_input,
         zeta_CR_0=args.zeta_cr,
-        nside_rt=args.nside
+        nside_rt=args.nside,
+        velocity_field=vel_field,
+        star=star,
     )
     if args.accelerator:
         from prism3d.chemistry.accelerator import ChemistryAccelerator
@@ -163,7 +223,9 @@ def run_model(args):
     # Run full evaluation suite (saves model, generates observations,
     # creates all figures, writes HTML report)
     from prism3d.evaluate import evaluate_model
-    report = evaluate_model(solver, output_dir=args.output, verbose=True)
+    incl = 4.0 if use_orion else 0.0
+    report = evaluate_model(solver, output_dir=args.output,
+                            inclination_deg=incl, verbose=True)
 
     return solver, report
 

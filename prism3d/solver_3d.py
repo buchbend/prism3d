@@ -19,12 +19,14 @@ Per-cell Python loops are only used for the BDF refinement pass.
 
 import numpy as np
 import time
+from ._rust_backend import has_rust, get_rust
 from .radiative_transfer.fuv_rt_3d import compute_fuv_field_3d
 from .radiative_transfer.shielding import f_shield_H2, f_shield_CO
 from .chemistry.solver import ChemistrySolver
 from .thermal.balance import ThermalSolver
 from .cosmic_rays.attenuation import cr_ionization_rate
 from .grains.themis import THEMISDust
+from .grains.themis_tables import THEMISTables
 from .utils.constants import (k_boltz, eV_to_erg, m_H, h_planck, c_light,
                                fine_structure_lines, gas_phase_abundances)
 
@@ -39,8 +41,9 @@ class PDRSolver3D:
         Hydrogen number density [cm^-3].
     box_size : float
         Physical box size [cm].
-    G0_external : float
-        External FUV field [Habing units].
+    G0_external : float or ndarray (n_rays,)
+        External FUV field [Habing units].  If scalar, isotropic.
+        If array, per-ray directional illumination (use ``directional_G0``).
     zeta_CR_0 : float
         Surface cosmic ray ionization rate [s^-1].
     nside_rt : int
@@ -51,7 +54,8 @@ class PDRSolver3D:
 
     def __init__(self, density, box_size, G0_external=1.0,
                  zeta_CR_0=2e-16, nside_rt=1, fixed_T=None,
-                 chem_network=None):
+                 chem_network=None, tile_size=64, velocity_field=None,
+                 star=None):
         self.density = np.asarray(density, dtype=np.float64)
         self.nx, self.ny, self.nz = self.density.shape
         self.n_cells = self.nx * self.ny * self.nz
@@ -61,9 +65,24 @@ class PDRSolver3D:
         self.zeta_CR_0 = zeta_CR_0
         self.nside_rt = nside_rt
         self.fixed_T = fixed_T
+        self.tile_size = tile_size  # For tiled thermal solver
+        self.velocity_field = np.asarray(velocity_field, dtype=np.float64) if velocity_field is not None else None
+        # Point source: dict with 'position' [cm] and 'L_FUV' [erg/s]
+        self.star = star
 
         # Initialize state arrays
         self._init_state()
+
+        # THEMIS lookup tables (precompute once, ~0.5 s)
+        self._themis_ref = THEMISDust(f_nano=1.0, E_g=0.1)
+        self.themis_tables = THEMISTables(self._themis_ref)
+
+        # Log backend
+        if has_rust():
+            core = get_rust()
+            print(f"  Rust core v{core.version()}: thermal + chemistry + PE (rayon parallel)")
+        else:
+            print("  Backend: Python/NumPy (Rust core not available)")
 
         # Solvers (kept for BDF refinement pass)
         self.chem_solver = ChemistrySolver(network=chem_network)
@@ -74,50 +93,60 @@ class PDRSolver3D:
         self.convergence_history = []
 
     def _init_state(self):
-        """Initialize all 3D state arrays."""
-        shape = (self.nx, self.ny, self.nz)
+        """Initialize all 3D state arrays.
 
-        # Radiation field
-        self.G0 = np.full(shape, self.G0_external)
-        self.A_V = np.zeros(shape)
-        self.N_H = np.zeros(shape)
-        self.N_H2 = np.zeros(shape)
-        self.N_CO = np.zeros(shape)
-        self.zeta_CR = np.full(shape, self.zeta_CR_0)
+        Uses float32 for state arrays to halve memory at 1024³
+        (4.3 GB vs 8.6 GB per array).  density stays float64 for RT.
+        Chemistry conservation uses float64 intermediates internally.
+        """
+        shape = (self.nx, self.ny, self.nz)
+        # Use float32 for large grids (> 128³), float64 for small
+        self._use_f32 = self.n_cells > 128**3
+        dt = np.float32 if self._use_f32 else np.float64
+
+        # Radiation field (scalar estimate for initialisation; overwritten by RT)
+        G0_init = float(np.max(self.G0_external)) if not np.isscalar(self.G0_external) else self.G0_external
+        self.G0 = np.full(shape, G0_init, dtype=dt)
+        self.A_V = np.zeros(shape, dtype=dt)
+        self.N_H = np.zeros(shape, dtype=dt)
+        self.N_H2 = np.zeros(shape, dtype=dt)
+        self.N_CO = np.zeros(shape, dtype=dt)
+        self.zeta_CR = np.full(shape, self.zeta_CR_0, dtype=dt)
 
         # Temperature
         if self.fixed_T is not None:
-            self.T_gas = np.full(shape, self.fixed_T)
+            self.T_gas = np.full(shape, self.fixed_T, dtype=dt)
         else:
-            self.T_gas = np.full(shape, 50.0)
-        self.T_dust = np.full(shape, 20.0)
+            self.T_gas = np.full(shape, 50.0, dtype=dt)
+        self.T_dust = np.full(shape, 20.0, dtype=dt)
 
         # Abundances (relative to n_H)
         x_C = gas_phase_abundances.get('C', 1.4e-4)
         x_O = gas_phase_abundances.get('O', 3.0e-4)
 
-        self.x_HI = np.full(shape, 0.5)
-        self.x_H2 = np.full(shape, 0.25)
-        self.x_Cp = np.full(shape, x_C * 0.5)
-        self.x_C = np.full(shape, x_C * 0.1)
-        self.x_CO = np.full(shape, x_C * 0.4)
-        self.x_O = np.full(shape, x_O - x_C * 0.4)
-        self.x_e = np.full(shape, x_C * 0.5)
-        self.x_OH = np.full(shape, 1e-8)
-        self.x_H2O = np.full(shape, 1e-8)
-        self.x_HCOp = np.full(shape, 1e-10)
+        self.x_HI = np.full(shape, 0.5, dtype=dt)
+        self.x_H2 = np.full(shape, 0.25, dtype=dt)
+        self.x_Cp = np.full(shape, x_C * 0.5, dtype=dt)
+        self.x_C = np.full(shape, x_C * 0.1, dtype=dt)
+        self.x_CO = np.full(shape, x_C * 0.4, dtype=dt)
+        self.x_O = np.full(shape, x_O - x_C * 0.4, dtype=dt)
+        self.x_e = np.full(shape, x_C * 0.5, dtype=dt)
+        self.x_OH = np.full(shape, 1e-8, dtype=dt)
+        self.x_H2O = np.full(shape, 1e-8, dtype=dt)
+        self.x_HCOp = np.full(shape, 1e-10, dtype=dt)
 
         # Heating/cooling diagnostics
-        self.Gamma = np.zeros(shape)
-        self.Lambda = np.zeros(shape)
+        self.Gamma = np.zeros(shape, dtype=dt)
+        self.Lambda = np.zeros(shape, dtype=dt)
 
         # ML accelerator (set externally before calling run())
         self.accelerator = None
 
         # THEMIS dust state (per cell)
-        self.f_nano = np.ones(shape)       # Nano-grain fraction (1.0 = diffuse ISM)
-        self.E_g = np.full(shape, 0.1)     # Band gap [eV] (0.1 = diffuse ISM)
-        self.Gamma_PE = np.zeros(shape)    # PE heating rate per cell
+        self.f_nano = np.ones(shape, dtype=dt)
+        self.E_g = np.full(shape, 0.1, dtype=dt)
+        self.Gamma_PE = np.zeros(shape, dtype=dt)
+        self._R_H2 = np.full(shape, 3e-17, dtype=dt)
 
     # ================================================================
     # AV/G0-dependent initial conditions
@@ -197,6 +226,10 @@ class PDRSolver3D:
                 print(f"Chemistry: explicit Euler")
             print(f"Dust steps: {dust_steps}, "
                   f"max inner iterations: {max_iterations}")
+            if self._use_f32:
+                gb = self.n_cells * 4 / 1e9
+                print(f"State dtype: float32 ({gb:.1f} GB/array, "
+                      f"~{gb*24:.0f} GB total)")
             print(f"{'='*60}")
 
         t_start = time.time()
@@ -235,12 +268,29 @@ class PDRSolver3D:
 
                 # Step 1: FUV Radiative Transfer
                 t0 = time.time()
-                self.G0, self.A_V, self.N_H, self.N_H2, self.N_CO = \
-                    compute_fuv_field_3d(
+                if self.star is not None:
+                    from .radiative_transfer.fuv_rt_3d import compute_fuv_field_point_source
+                    G0, A_V, N_H, N_H2, N_CO = compute_fuv_field_point_source(
+                        self.density, self.star['position'],
+                        self.star['L_FUV'], self.cell_size,
+                        x_H2=self.x_H2, x_CO=self.x_CO,
+                    )
+                else:
+                    G0, A_V, N_H, N_H2, N_CO = compute_fuv_field_3d(
                         self.density, self.G0_external, self.cell_size,
                         x_H2=self.x_H2, x_CO=self.x_CO,
                         nside=self.nside_rt
                     )
+                # Cast RT outputs to state dtype (float32 for large grids)
+                if self._use_f32:
+                    self.G0 = G0.astype(np.float32)
+                    self.A_V = A_V.astype(np.float32)
+                    self.N_H = N_H.astype(np.float32)
+                    self.N_H2 = N_H2.astype(np.float32)
+                    self.N_CO = N_CO.astype(np.float32)
+                else:
+                    self.G0, self.A_V = G0, A_V
+                    self.N_H, self.N_H2, self.N_CO = N_H, N_H2, N_CO
                 self.timing['RT'] = time.time() - t0
 
                 # On very first iteration, seed from analytical profiles
@@ -459,24 +509,25 @@ class PDRSolver3D:
     def _update_dust_heating(self):
         """Compute PE heating rate and T_dust for current grain state.
 
-        Instantaneous — no time evolution.  Called every inner iteration.
+        Uses THEMIS lookup tables for proper charge-distribution PE
+        heating (replaces BT94 approximation).  Instantaneous — no
+        time evolution.  Called every inner iteration.
         """
-        G0 = self.G0
-        nH = self.density
+        dt = self.T_gas.dtype
+        self.Gamma_PE = self.themis_tables.pe_heating_vec(
+            self.G0, self.T_gas, self.x_e, self.density,
+            self.f_nano, self.E_g
+        ).astype(dt)
 
-        # PE heating (BT94 scaled by f_nano for THEMIS consistency)
-        n_e = np.maximum(self.x_e, 1e-10) * nH
-        psi = G0 * np.sqrt(self.T_gas) / n_e
-        epsilon = (0.049 / (1.0 + (psi / 1925.0)**0.73) +
-                   0.037 * (self.T_gas / 1e4)**0.7 / (1.0 + psi / 5000.0))
-        self.Gamma_PE = 1.3e-24 * epsilon * G0 * nH * self.f_nano
+        # THEMIS-calibrated dust temperature
+        self.T_dust = self.themis_tables.dust_temperature_vec(
+            self.G0, self.A_V, nH=self.density, T_gas=self.T_gas
+        ).astype(dt)
 
-        # Dust temperature
-        F_abs = 1.6e-3 * G0 * np.exp(-1.8 * self.A_V)
-        self.T_dust = np.clip(
-            16.4 * (np.maximum(F_abs, 1e-30) / 1.6e-3)**0.2,
-            5.0, 200.0
-        )
+        # Precompute THEMIS H2 formation rate for use in chemistry + thermal
+        self._R_H2 = self.themis_tables.h2_formation_rate_vec(
+            self.T_gas, self.T_dust, self.f_nano
+        ).astype(dt)
 
     # ================================================================
     # Vectorized chemistry (explicit Euler on full grid)
@@ -484,16 +535,64 @@ class PDRSolver3D:
 
     def _solve_chemistry_vec(self, f_sh_H2, f_sh_CO, n_substeps=200,
                               conv_tol=1e-4):
-        """Vectorized explicit Euler chemistry on the full 3D grid."""
+        """Vectorized explicit Euler chemistry on the full 3D grid.
+
+        Uses Rust backend when available for parallel per-cell integration.
+        """
         nH = self.density
         T = self.T_gas
-        g0 = self.G0
-        av = self.A_V
         zeta = self.zeta_CR
 
         x_C_total = gas_phase_abundances.get('C', 1.4e-4)
         x_O_total = gas_phase_abundances.get('O', 3.0e-4)
 
+        # Precompute T-independent rate coefficients (constant over substeps)
+        k_pd_base = 4.43e-11 * self.G0 * np.exp(-3.74 * self.A_V) * f_sh_H2
+        k_ci = 2.56e-10 * self.G0 * np.exp(-3.02 * self.A_V)
+        alpha_Cp = 4.67e-12 * np.power(T / 300.0, -0.6)
+        k_co = 1.71e-10 * self.G0 * np.exp(-3.53 * self.A_V) * f_sh_CO
+        k_co_cr = 6.0 * zeta
+        R_cr_base = 2.5 * zeta * 0.1
+        k_co_total = k_co + k_co_cr
+        R_H2_half_nH = self._R_H2 * nH * 0.5
+
+        # ── Rust fast path ──
+        if has_rust() and self.accelerator is None:
+            core = get_rust()
+            to_f64_flat = lambda a: np.ascontiguousarray(a, dtype=np.float64).ravel()
+            shape = self.T_gas.shape
+            dt_state = self.T_gas.dtype
+            # Prepare state as f64 flat arrays
+            x_hi = to_f64_flat(self.x_HI)
+            x_h2 = to_f64_flat(self.x_H2)
+            x_cp = to_f64_flat(self.x_Cp)
+            x_c = to_f64_flat(self.x_C)
+            x_co = to_f64_flat(self.x_CO)
+            x_o = to_f64_flat(self.x_O)
+            x_e = to_f64_flat(self.x_e)
+            core.solve_chemistry_euler(
+                to_f64_flat(nH),
+                to_f64_flat(k_pd_base),
+                to_f64_flat(k_ci),
+                to_f64_flat(alpha_Cp),
+                to_f64_flat(k_co_total),
+                to_f64_flat(R_H2_half_nH),
+                to_f64_flat(R_cr_base),
+                x_C_total,
+                x_hi, x_h2, x_cp, x_c, x_co, x_o, x_e,
+                to_f64_flat(self.x_HCOp),
+                n_substeps, conv_tol,
+            )
+            self.x_HI = x_hi.reshape(shape).astype(dt_state)
+            self.x_H2 = x_h2.reshape(shape).astype(dt_state)
+            self.x_Cp = x_cp.reshape(shape).astype(dt_state)
+            self.x_C = x_c.reshape(shape).astype(dt_state)
+            self.x_CO = x_co.reshape(shape).astype(dt_state)
+            self.x_O = x_o.reshape(shape).astype(dt_state)
+            self.x_e = x_e.reshape(shape).astype(dt_state)
+            return self.n_cells
+
+        # ── Python fallback ──
         dt = 1e10  # Initial timestep [s]
 
         for step in range(n_substeps):
@@ -504,25 +603,21 @@ class PDRSolver3D:
             xCO = self.x_CO
             xe = self.x_e
 
-            # H2 formation/destruction
-            R_H2_form = 3e-17 * xH * nH * 0.5
-            k_pd = 4.43e-11 * g0 * np.exp(-3.74 * av) * f_sh_H2
-            R_pd = k_pd * xH2
-            R_cr = 2.5 * zeta * xH2 * 0.1
+            # H2 formation/destruction (THEMIS grain-surface rate)
+            R_H2_form = R_H2_half_nH * xH
+            R_pd = k_pd_base * xH2
+            R_cr = R_cr_base * xH2
 
             dxH2 = R_H2_form - R_pd - R_cr
             dxH = -2.0 * dxH2
 
             # Carbon chemistry
-            k_ci = 2.56e-10 * g0 * np.exp(-3.02 * av)
-            alpha_Cp = 4.67e-12 * np.power(T / 300.0, -0.6)
-            k_co = 1.71e-10 * g0 * np.exp(-3.53 * av) * f_sh_CO
-            k_co_cr = 6.0 * zeta
-            xOH = 1e-9 + 9e-8 * np.clip(xH2 / 0.1, 0, 1)
+            alpha_ne = alpha_Cp * xe * nH
+            xOH = 1e-9 + 9e-8 * np.clip(xH2 * 10.0, 0, 1)
 
-            dxCp = k_ci * xC - alpha_Cp * xCp * xe * nH + (k_co + k_co_cr) * xCO
-            dxCO = 1e-10 * xC * xOH * nH - (k_co + k_co_cr) * xCO
-            dxC = -k_ci * xC + alpha_Cp * xCp * xe * nH - 1e-10 * xC * xOH * nH
+            dxCp = k_ci * xC - alpha_ne * xCp + k_co_total * xCO
+            dxCO = 1e-10 * xC * xOH * nH - k_co_total * xCO
+            dxC = -k_ci * xC + alpha_ne * xCp - 1e-10 * xC * xOH * nH
 
             # Adaptive dt per cell
             max_rate = np.maximum(
@@ -547,9 +642,17 @@ class PDRSolver3D:
             self.x_HI /= H_sum
             self.x_H2 /= H_sum
 
-            # C conservation: rescale C species
-            C_sum = self.x_Cp + self.x_C + self.x_CO
-            scale = np.where(C_sum > 0, x_C_total / C_sum, 1.0)
+            # C conservation: rescale C species (upcast sum to float64
+            # only for float32 grids where x_CO << x_Cp would lose bits)
+            if self._use_f32:
+                C_sum = (self.x_Cp.astype(np.float64)
+                         + self.x_C.astype(np.float64)
+                         + self.x_CO.astype(np.float64))
+                scale = np.where(C_sum > 0, x_C_total / C_sum, 1.0)
+                scale = scale.astype(self.x_Cp.dtype)
+            else:
+                C_sum = self.x_Cp + self.x_C + self.x_CO
+                scale = np.where(C_sum > 0, x_C_total / C_sum, 1.0)
             self.x_Cp *= scale
             self.x_C *= scale
             self.x_CO *= scale
@@ -574,24 +677,219 @@ class PDRSolver3D:
     # Vectorized thermal balance (bisection on full grid)
     # ================================================================
 
-    def _solve_thermal_vec(self, f_sh_H2, n_bisect=40):
-        """Vectorized bisection thermal equilibrium solver."""
+    def _solve_thermal_vec(self, f_sh_H2):
+        """Vectorized hybrid bisection-Newton thermal equilibrium solver.
+
+        When Rust backend is available, uses rayon for parallel per-cell
+        solving (no tiling needed). Otherwise, for large grids (> 256³),
+        uses tiled processing to keep the working set in L3 cache.
+        """
+        # Rust handles all grid sizes efficiently via rayon work-stealing
+        if has_rust() or self.n_cells <= 256**3:
+            self._solve_thermal_full(f_sh_H2)
+        else:
+            self._solve_thermal_tiled(f_sh_H2)
+
+    def _prepare_thermal_ctx(self, f_sh_H2):
+        """Precompute all T-independent quantities for thermal solver.
+
+        During thermal equilibrium, only T varies. All abundances,
+        density, G0, AV are fixed. Precomputing saves ~6 heating terms
+        and density products from being recomputed 16× per solve.
+        """
+        nH = self.density
+
+        # --- T-independent heating sum ---
+        # All heating except gas-grain is T-independent
+        uv_atten = self.G0 * np.exp(-3.74 * self.A_V) * f_sh_H2
+        Gamma_fixed = self.Gamma_PE.copy()
+        Gamma_fixed += 3.3e-11 * uv_atten * self.x_H2 * nH * (0.4 * eV_to_erg)
+        Gamma_fixed += self._R_H2 * self.x_HI * nH**2 * (1.5 * eV_to_erg)
+        Gamma_fixed += 3.0e-10 * uv_atten * self.x_H2 * nH * (2.0 * eV_to_erg) * (nH / (nH + 3e4))
+        Gamma_fixed += self.zeta_CR * (self.x_HI + 2.0 * self.x_H2) * nH * (20.0 * eV_to_erg)
+        Gamma_fixed += 3.0e-10 * self.G0 * np.exp(-3.0 * self.A_V) * self.x_C * nH * eV_to_erg
+
+        # Gas-grain coefficient: Gamma_gg(T) = gg_coeff * sqrt(T) * (T_dust - T)
+        mu = np.where(self.x_H2 > 0.5, 2.0, 1.0)
+        gg_coeff = 2.0 * 0.35 * 1e-21 * nH**2 * np.sqrt(
+            8.0 * k_boltz / (np.pi * mu * m_H)) * k_boltz
+
+        # --- Cooling density products (T-independent) ---
+        n_e = self.x_e * nH
+        n_HI = self.x_HI * nH
+        n_H2 = self.x_H2 * nH
+        n_CO = self.x_CO * nH
+        nCp_nH = self.x_Cp * nH
+        nO_nH = self.x_O * nH
+        nC_nH = self.x_C * nH
+
+        # --- Fine-structure line constants (avoid dict lookup per eval) ---
+        _, CII_f, CII_A, CII_T, CII_gu, CII_gl = fine_structure_lines['CII_158']
+        _, OI63_f, OI63_A, OI63_T, OI63_gu, OI63_gl = fine_structure_lines['OI_63']
+        _, OI145_f, OI145_A, OI145_T, OI145_gu, OI145_gl = fine_structure_lines['OI_145']
+        CI_consts = []
+        for name in ('CI_609', 'CI_370'):
+            _, f, A, Tul, gu, gl = fine_structure_lines[name]
+            CI_consts.append((f, A, Tul, gu, gl))
+
+        # --- CO J-level constants (precompute scalars once) ---
+        B_rot = 57.635968e9
+        mu_d = 0.1098e-18
+        co_J = []
+        for J_u in range(1, 41):
+            freq = 2.0 * B_rot * J_u
+            T_u = h_planck * B_rot * J_u * (J_u + 1) / k_boltz
+            A_co = (64.0 * np.pi**4 * freq**3 * mu_d**2 * J_u) / \
+                   (3.0 * h_planck * c_light**3 * (2 * J_u + 1))
+            g_ratio = (2 * J_u + 1) / (2 * (J_u - 1) + 1)
+            J_factor = 1.0 + 0.1 * J_u
+            Ahv = A_co * h_planck * freq
+            co_J.append((T_u, A_co, g_ratio, J_factor, Ahv))
+
+        return (Gamma_fixed, gg_coeff, self.T_dust,
+                n_e, n_HI, n_H2, n_CO, nCp_nH, nO_nH, nC_nH, mu, nH,
+                CII_f, CII_A, CII_T, CII_gu, CII_gl,
+                OI63_f, OI63_A, OI63_T, OI63_gu, OI63_gl,
+                OI145_f, OI145_A, OI145_T, OI145_gu, OI145_gl,
+                CI_consts, co_J)
+
+    def _solve_thermal_full(self, f_sh_H2, n_bisect=10, n_newton=3):
+        """Hybrid bisection-Newton solver on full grid.
+
+        Precomputes all T-independent quantities once, then runs
+        10 bisection + 3 Newton steps using only T-dependent ops.
+        Uses Rust backend when available for ~10-50x speedup.
+        """
+        ctx = self._prepare_thermal_ctx(f_sh_H2)
+
+        # ── Rust fast path ──
+        if has_rust():
+            (Gamma_fixed, gg_coeff, T_dust_ctx,
+             n_e, n_HI, n_H2, n_CO, nCp_nH, nO_nH, nC_nH, mu, nH,
+             CII_f, CII_A, CII_T, CII_gu, CII_gl,
+             OI63_f, OI63_A, OI63_T, OI63_gu, OI63_gl,
+             OI145_f, OI145_A, OI145_T, OI145_gu, OI145_gl,
+             CI_consts, co_J) = ctx
+            core = get_rust()
+            # Flatten to f64 1D arrays
+            to_f64_flat = lambda a: np.ascontiguousarray(a, dtype=np.float64).ravel()
+            t_out = np.ascontiguousarray(self.T_gas, dtype=np.float64).ravel()
+            # Pack line constants
+            cii_p = np.array([CII_f, CII_A, CII_T, CII_gu, CII_gl], dtype=np.float64)
+            oi63_p = np.array([OI63_f, OI63_A, OI63_T, OI63_gu, OI63_gl], dtype=np.float64)
+            oi145_p = np.array([OI145_f, OI145_A, OI145_T, OI145_gu, OI145_gl], dtype=np.float64)
+            ci_p = np.array([v for tup in CI_consts for v in tup], dtype=np.float64)
+            core.solve_thermal_vec(
+                to_f64_flat(Gamma_fixed),
+                to_f64_flat(gg_coeff),
+                to_f64_flat(T_dust_ctx),
+                to_f64_flat(n_e),
+                to_f64_flat(n_HI),
+                to_f64_flat(n_H2),
+                to_f64_flat(n_CO),
+                to_f64_flat(nCp_nH),
+                to_f64_flat(nO_nH),
+                to_f64_flat(nC_nH),
+                cii_p, oi63_p, oi145_p, ci_p,
+                n_bisect, n_newton,
+                t_out,
+            )
+            self.T_gas = t_out.reshape(self.T_gas.shape).astype(self.T_gas.dtype)
+            self.Gamma = self._total_heating_vec(self.T_gas, f_sh_H2)
+            self.Lambda = self._total_cooling_vec(self.T_gas)
+            return
+
+        # ── Python fallback ──
         T_lo = np.full_like(self.T_gas, 10.0)
         T_hi = np.full_like(self.T_gas, 1e5)
 
+        # Phase 1: bisection to narrow bracket
         for _ in range(n_bisect):
-            T_mid = np.sqrt(T_lo * T_hi)  # geometric mean for log-spaced search
-            net = self._net_heating_vec(T_mid, f_sh_H2)
-            heating_wins = net > 0
-            T_lo = np.where(heating_wins, T_mid, T_lo)
-            T_hi = np.where(~heating_wins, T_mid, T_hi)
+            T_mid = np.sqrt(T_lo * T_hi)
+            net = _net_heating_ctx(T_mid, ctx)
+            pos = net > 0
+            T_lo = np.where(pos, T_mid, T_lo)
+            T_hi = np.where(~pos, T_mid, T_hi)
 
-        T_eq = np.sqrt(T_lo * T_hi)
-        self.T_gas = T_eq
+        # Phase 2: Newton-Raphson with clamping to bracket
+        T = np.sqrt(T_lo * T_hi)
+        for _ in range(n_newton):
+            f = _net_heating_ctx(T, ctx)
+            pos = f > 0
+            T_lo = np.where(pos, np.maximum(T, T_lo), T_lo)
+            T_hi = np.where(~pos, np.minimum(T, T_hi), T_hi)
+            eps = T * 0.01
+            fp = _net_heating_ctx(T + eps, ctx)
+            dfdT = (fp - f) / eps
+            dT = -f / np.where(np.abs(dfdT) > 1e-50, dfdT, -1e-50)
+            dT = np.clip(dT, -(T - T_lo), T_hi - T)
+            dT = np.clip(dT, -0.5 * T, 0.5 * T)
+            T = T + dT
+
+        self.T_gas = T
 
         # Compute final rates for diagnostics
-        self.Gamma = self._total_heating_vec(T_eq, f_sh_H2)
-        self.Lambda = self._total_cooling_vec(T_eq)
+        self.Gamma = self._total_heating_vec(T, f_sh_H2)
+        self.Lambda = self._total_cooling_vec(T)
+
+    def _solve_thermal_tiled(self, f_sh_H2, n_bisect=10, n_newton=3):
+        """Tiled hybrid bisection-Newton for large grids.
+
+        Processes the grid in tile_size³ chunks so that the working
+        set fits in L3 cache.  Precomputes T-independent context
+        per tile before the bisection loop.
+        """
+        # Precompute full-grid context, then slice per tile
+        ctx_full = self._prepare_thermal_ctx(f_sh_H2)
+
+        ts = self.tile_size
+        nx, ny, nz = self.nx, self.ny, self.nz
+
+        for ix0 in range(0, nx, ts):
+            ix1 = min(ix0 + ts, nx)
+            for iy0 in range(0, ny, ts):
+                iy1 = min(iy0 + ts, ny)
+                for iz0 in range(0, nz, ts):
+                    iz1 = min(iz0 + ts, nz)
+                    sl = (slice(ix0, ix1), slice(iy0, iy1), slice(iz0, iz1))
+
+                    # Slice the precomputed context for this tile
+                    ctx = _slice_ctx(ctx_full, sl)
+
+                    # Phase 1: bisection to narrow bracket
+                    T_lo = np.full(self.density[sl].shape, 10.0,
+                                   dtype=self.T_gas.dtype)
+                    T_hi = np.full(self.density[sl].shape, 1e5,
+                                   dtype=self.T_gas.dtype)
+
+                    for _ in range(n_bisect):
+                        T_mid = np.sqrt(T_lo * T_hi)
+                        net = _net_heating_ctx(T_mid, ctx)
+                        pos = net > 0
+                        T_lo = np.where(pos, T_mid, T_lo)
+                        T_hi = np.where(~pos, T_mid, T_hi)
+
+                    # Phase 2: Newton-Raphson with clamping
+                    T = np.sqrt(T_lo * T_hi)
+                    for _ in range(n_newton):
+                        f = _net_heating_ctx(T, ctx)
+                        pos = f > 0
+                        T_lo = np.where(pos, np.maximum(T, T_lo), T_lo)
+                        T_hi = np.where(~pos, np.minimum(T, T_hi), T_hi)
+                        eps = T * 0.01
+                        fp = _net_heating_ctx(T + eps, ctx)
+                        dfdT = (fp - f) / eps
+                        dT = -f / np.where(np.abs(dfdT) > 1e-50,
+                                           dfdT, -1e-50)
+                        dT = np.clip(dT, -(T - T_lo), T_hi - T)
+                        dT = np.clip(dT, -0.5 * T, 0.5 * T)
+                        T = T + dT
+
+                    self.T_gas[sl] = T
+
+        # Diagnostics (full-grid, computed once after tiled solve)
+        self.Gamma = self._total_heating_vec(self.T_gas, f_sh_H2)
+        self.Lambda = self._total_cooling_vec(self.T_gas)
 
     def _net_heating_vec(self, T, f_sh_H2):
         """Net heating rate (Gamma - Lambda) at temperature T for all cells."""
@@ -609,19 +907,15 @@ class PDRSolver3D:
         xC = self.x_C
         T_dust = self.T_dust
 
-        # PE heating (Bakes & Tielens 1994)
-        n_e = np.maximum(xe * nH, 1e-10 * nH)
-        psi = G0 * np.sqrt(T) / n_e
-        epsilon = (0.049 / (1.0 + (psi / 1925.0)**0.73) +
-                   0.037 * (T / 1e4)**0.7 / (1.0 + psi / 5000.0))
-        Gamma = 1.3e-24 * epsilon * G0 * nH
+        # PE heating (THEMIS charge-distribution, precomputed)
+        Gamma = self.Gamma_PE.copy()
 
         # H2 photodissociation
         k_pd = 3.3e-11 * G0 * np.exp(-3.74 * AV) * f_sh_H2
         Gamma += k_pd * xH2 * nH * 0.4 * eV_to_erg
 
-        # H2 formation on grains
-        Gamma += 3e-17 * np.sqrt(T / 100.0) * xHI * nH * nH * 1.5 * eV_to_erg
+        # H2 formation on grains (THEMIS surface rate)
+        Gamma += self._R_H2 * xHI * nH * nH * 1.5 * eV_to_erg
 
         # H2 UV pumping
         k_pump = 3.0e-10 * G0 * np.exp(-3.74 * AV) * f_sh_H2
@@ -855,7 +1149,7 @@ class PDRSolver3D:
 
     def save(self, filepath):
         """Save model state to numpy archive for HPC workflows."""
-        np.savez_compressed(filepath,
+        save_dict = dict(
             density=self.density,
             T_gas=self.T_gas, T_dust=self.T_dust,
             G0=self.G0, A_V=self.A_V,
@@ -871,21 +1165,28 @@ class PDRSolver3D:
             box_size=self.box_size, G0_external=self.G0_external,
             zeta_CR_0=self.zeta_CR_0,
         )
+        if self.velocity_field is not None:
+            save_dict['velocity_field'] = self.velocity_field
+        np.savez_compressed(filepath, **save_dict)
 
     @classmethod
     def load(cls, filepath):
         """Load model state from numpy archive."""
         data = np.load(filepath)
+        vel = data['velocity_field'] if 'velocity_field' in data else None
         solver = cls(
             data['density'], float(data['box_size']),
             G0_external=float(data['G0_external']),
             zeta_CR_0=float(data['zeta_CR_0']),
+            velocity_field=vel,
         )
+        dt = solver.T_gas.dtype  # float32 or float64 based on grid size
         for key in ['T_gas', 'T_dust', 'G0', 'A_V', 'N_H', 'N_H2', 'N_CO',
                      'zeta_CR', 'x_HI', 'x_H2', 'x_Cp', 'x_C', 'x_CO',
-                     'x_O', 'x_e', 'x_OH', 'x_H2O', 'x_HCOp', 'Gamma', 'Lambda']:
+                     'x_O', 'x_e', 'x_OH', 'x_H2O', 'x_HCOp',
+                     'Gamma', 'Lambda', 'Gamma_PE', 'f_nano', 'E_g']:
             if key in data:
-                setattr(solver, key, data[key])
+                setattr(solver, key, data[key].astype(dt))
         return solver
 
     def _print_timing(self):
@@ -935,3 +1236,120 @@ class PDRSolver3D:
             'E_g': self.E_g[s],
             'Gamma_PE': self.Gamma_PE[s],
         }
+
+
+# ====================================================================
+# Context-based thermal evaluation (free functions)
+# ====================================================================
+
+def _slice_ctx(ctx, sl):
+    """Slice a precomputed thermal context for a tile."""
+    # ctx is a tuple: (Gamma_fixed, gg_coeff, T_dust,
+    #   n_e, n_HI, n_H2, n_CO, nCp_nH, nO_nH, nC_nH, mu, nH,
+    #   CII_f, CII_A, CII_T, CII_gu, CII_gl,
+    #   OI63_f, OI63_A, OI63_T, OI63_gu, OI63_gl,
+    #   OI145_f, OI145_A, OI145_T, OI145_gu, OI145_gl,
+    #   CI_consts, co_J)
+    # Slice only the array elements (indices 0-11), keep scalars as-is
+    return (ctx[0][sl], ctx[1][sl], ctx[2][sl],
+            ctx[3][sl], ctx[4][sl], ctx[5][sl], ctx[6][sl],
+            ctx[7][sl], ctx[8][sl], ctx[9][sl], ctx[10][sl], ctx[11][sl],
+            *ctx[12:])
+
+
+def _net_heating_ctx(T, ctx):
+    """Merged net heating rate using precomputed T-independent context.
+
+    Heating: only gas-grain depends on T (everything else precomputed).
+    Cooling: all T-dependent, but density products and line constants cached.
+    """
+    (Gamma_fixed, gg_coeff, T_dust,
+     n_e, n_HI, n_H2, n_CO, nCp_nH, nO_nH, nC_nH, mu, nH,
+     CII_f, CII_A, CII_T, CII_gu, CII_gl,
+     OI63_f, OI63_A, OI63_T, OI63_gu, OI63_gl,
+     OI145_f, OI145_A, OI145_T, OI145_gu, OI145_gl,
+     CI_consts, co_J) = ctx
+
+    # --- Heating: precomputed sum + gas-grain (only T-dependent term) ---
+    sqrtT = np.sqrt(T)
+    net = Gamma_fixed + gg_coeff * sqrtT * (T_dust - T)
+
+    # --- Cooling (subtract from net) ---
+    inv_T = 1.0 / T
+
+    # [CII] 158 um
+    gamma_e = 8.63e-6 / (CII_gl * sqrtT) * 2.15 * np.exp(-CII_T * inv_T)
+    gamma_H = 8.0e-10 * (T * 0.01)**0.07
+    gamma_H2 = 4.9e-10 * (T * 0.01)**0.12
+    q_coll = gamma_e * n_e + gamma_H * n_HI + gamma_H2 * n_H2
+    R_ul = CII_A + q_coll
+    R_lu = (CII_gu / CII_gl) * q_coll * np.exp(-CII_T * inv_T)
+    net -= nCp_nH * R_lu / (R_lu + R_ul) * CII_A * h_planck * CII_f
+
+    # [OI] 63 um
+    gamma_H_63 = 9.2e-12 * T**0.67
+    gamma_H2_63 = 4.5e-12 * T**0.64
+    gamma_e_63 = 1.4e-8 * (T * 0.01)**0.39
+    q_63 = gamma_H_63 * n_HI + gamma_H2_63 * n_H2 + gamma_e_63 * n_e
+    R_lu_63 = (OI63_gu / OI63_gl) * q_63 * np.exp(-OI63_T * inv_T)
+    R_ul_63 = OI63_A + q_63
+    net -= nO_nH * R_lu_63 / (R_lu_63 + R_ul_63) * OI63_A * h_planck * OI63_f
+
+    # [OI] 145 um
+    gamma_H_145 = 4.0e-12 * T**0.60
+    gamma_H2_145 = 2.0e-12 * T**0.58
+    gamma_e_145 = 5.0e-9 * (T * 0.01)**0.39
+    q_145 = gamma_H_145 * n_HI + gamma_H2_145 * n_H2 + gamma_e_145 * n_e
+    R_lu_145 = (OI145_gu / OI145_gl) * q_145 * np.exp(-OI145_T * inv_T)
+    R_ul_145 = OI145_A + q_145
+    net -= nO_nH * R_lu_145 / (R_lu_145 + R_ul_145) * OI145_A * h_planck * OI145_f
+
+    # [CI] 609 + 370 um
+    T_01 = T * 0.01
+    T_01_03 = T_01**0.3
+    T_01_m05 = T_01**(-0.5)
+    for ci_f, ci_A, ci_T, ci_gu, ci_gl in CI_consts:
+        q_ci = 1.0e-10 * T_01_03 * n_HI + 5.0e-11 * T_01_03 * n_H2 + 2.0e-7 * T_01_m05 * n_e
+        R_lu_ci = (ci_gu / ci_gl) * q_ci * np.exp(-ci_T * inv_T)
+        R_ul_ci = ci_A + q_ci
+        net -= nC_nH * R_lu_ci / (R_lu_ci + R_ul_ci) * ci_A * h_planck * ci_f
+
+    # CO rotational (precomputed J-level constants)
+    sqrtT_01 = np.sqrt(T_01)
+    for T_u, A_co, g_ratio, J_factor, Ahv in co_J:
+        mask = T_u < 5.0 * T
+        if not np.any(mask):
+            break
+        gamma_H2_co = 3.3e-11 * sqrtT_01 * J_factor
+        R_lu_co = g_ratio * gamma_H2_co * n_H2 * np.exp(-T_u * inv_T)
+        R_ul_co = A_co + gamma_H2_co * n_H2
+        net -= np.where(mask, n_CO * R_lu_co / (R_lu_co + R_ul_co) * Ahv, 0.0)
+
+    # H2 rovibrational (Glover & Abel 2008)
+    logT = np.clip(np.log10(np.maximum(T, 100.0)), 2.0, 4.5)
+    log_LH = (-24.311 + 3.5692 * logT - 11.332 * logT**2
+               + 15.738 * logT**3 - 10.581 * logT**4
+               + 3.5803 * logT**5 - 0.48365 * logT**6)
+    log_LH2 = (-24.311 + 4.6585 * logT - 14.272 * logT**2
+                + 19.779 * logT**3 - 13.255 * logT**4
+                + 4.4840 * logT**5 - 0.60504 * logT**6)
+    L_H = 10**log_LH
+    L_H2_cool = 10**log_LH2
+    L_LTE = 10**(-19.703 + 0.5 * logT)
+    L0 = L_H * n_HI + L_H2_cool * n_H2
+    Lambda_H2 = n_H2 * L0 * L_LTE / np.maximum(L0 + L_LTE, 1e-50)
+    net -= np.where(T >= 100, Lambda_H2, 0.0)
+
+    # Lyman-alpha
+    q_lu = 2.41e-6 / sqrtT * 0.486 * np.exp(-1.18e5 * inv_T)
+    net -= np.where(T >= 3000, n_HI * n_e * q_lu * 10.2 * eV_to_erg, 0.0)
+
+    # Gas-grain cooling (heating part already in Gamma_fixed via gg_coeff)
+    gg_cool = gg_coeff * sqrtT * (T - T_dust)
+    net -= np.maximum(gg_cool, 0.0)
+
+    # Recombination cooling
+    alpha_Cp = 4.67e-12 * (T / 300.0)**(-0.6)
+    net -= nCp_nH * n_e * alpha_Cp * k_boltz * T
+
+    return net

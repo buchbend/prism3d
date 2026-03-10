@@ -132,10 +132,17 @@ def integrate_column(solver, quantity, los_axis=2):
     return np.sum(data, axis=los_axis) * solver.cell_size
 
 
-def column_density_maps(solver, los_axis=2):
+def column_density_maps(solver, los_axis=2, inclination_deg=0.0):
     """
     Compute column density maps for all major species.
-    
+
+    Parameters
+    ----------
+    solver : PDRSolver3D
+    los_axis : int
+    inclination_deg : float
+        Viewing inclination [degrees].
+
     Returns
     -------
     maps : dict of 2D arrays
@@ -143,43 +150,50 @@ def column_density_maps(solver, los_axis=2):
     """
     ds = solver.cell_size
     maps = {}
-    
+
+    def _integrate(field_3d):
+        if abs(inclination_deg) > 0.01:
+            field_3d = _apply_inclination(field_3d, los_axis, inclination_deg)
+        return np.sum(field_3d, axis=los_axis) * ds
+
     # Total H column
-    maps['N_H'] = np.sum(solver.density, axis=los_axis) * ds
-    
+    maps['N_H'] = _integrate(solver.density)
+
     # H2 column
-    maps['N_H2'] = np.sum(solver.density * solver.x_H2 * 2, axis=los_axis) * ds
-    
+    maps['N_H2'] = _integrate(solver.density * solver.x_H2 * 2)
+
     # CO column
-    maps['N_CO'] = np.sum(solver.density * solver.x_CO, axis=los_axis) * ds
-    
+    maps['N_CO'] = _integrate(solver.density * solver.x_CO)
+
     # C+ column
-    maps['N_Cp'] = np.sum(solver.density * solver.x_Cp, axis=los_axis) * ds
-    
+    maps['N_Cp'] = _integrate(solver.density * solver.x_Cp)
+
     # Electron column
-    maps['N_e'] = np.sum(solver.density * solver.x_e, axis=los_axis) * ds
-    
+    maps['N_e'] = _integrate(solver.density * solver.x_e)
+
     # Total visual extinction through the cloud
     from ..utils.constants import AV_per_NH
     maps['A_V_total'] = maps['N_H'] * AV_per_NH
-    
+
     return maps
 
 
-def dust_continuum_map(solver, lam_um, los_axis=2):
+def dust_continuum_map(solver, lam_um, los_axis=2, inclination_deg=0.0):
     """
     Compute a dust continuum emission map at a given wavelength.
-    
+
     Integrates the thermal dust emission along the LOS.
     Uses modified blackbody with local T_dust and density.
-    
+
     Parameters
     ----------
     solver : PDRSolver3D
     lam_um : float
         Wavelength [μm]
     los_axis : int
-    
+    inclination_deg : float
+        Viewing inclination [degrees].
+
     Returns
     -------
     I_nu : ndarray (2D)
@@ -187,43 +201,49 @@ def dust_continuum_map(solver, lam_um, los_axis=2):
     """
     lam_cm = lam_um * 1e-4
     nu = c_light / lam_cm
-    
+
     # Dust opacity per H: kappa_nu = kappa_0 * (nu/nu_0)^beta
-    # Using standard ISM values
     nu_0 = c_light / (250e-4)  # 250 μm reference
     kappa_0 = 0.04  # cm²/g at 250 μm (Hildebrand 1983)
     beta = 1.8
     kappa_nu = kappa_0 * (nu / nu_0)**beta
-    
+
     # Emissivity per cell: j_nu = n_H * m_H * D/G * kappa_nu * B_nu(T_dust)
     D2G = 0.01  # dust-to-gas ratio
-    
+
     # Build 3D emissivity
     x = h_planck * nu / (k_boltz * solver.T_dust)
     x = np.clip(x, 0, 500)
     B_nu = 2 * h_planck * nu**3 / c_light**2 / (np.exp(x) - 1 + 1e-30)
-    
+
     j_nu = solver.density * m_H * D2G * kappa_nu * B_nu  # erg/s/cm³/Hz/sr
-    
+
+    # Apply inclination shear before integration
+    if abs(inclination_deg) > 0.01:
+        j_nu = _apply_inclination(j_nu, los_axis, inclination_deg)
+
     # Integrate along LOS
     I_nu = np.sum(j_nu, axis=los_axis) * solver.cell_size
-    
+
     return I_nu
 
 
-def line_emission_map(solver, line_name, los_axis=2):
+def line_emission_map(solver, line_name, los_axis=2, inclination_deg=0.0):
     """
     Compute a fine-structure line emission map.
-    
+
     Uses the thin-limit emissivity with escape probability correction
     for [CII] and [OI].
-    
+
     Parameters
     ----------
     solver : PDRSolver3D
     line_name : str
         Line identifier (e.g., 'CII_158', 'OI_63', 'CO_1-0')
-    
+    los_axis : int
+    inclination_deg : float
+        Viewing inclination [degrees].
+
     Returns
     -------
     I_line : ndarray (2D)
@@ -305,7 +325,12 @@ def line_emission_map(solver, line_name, los_axis=2):
     
     # Optical depth per cell at line center
     dtau = kappa_line * phi_Hz * solver.cell_size
-    
+
+    # Apply inclination shear before LOS integration
+    if abs(inclination_deg) > 0.01:
+        j_line = _apply_inclination(j_line, los_axis, inclination_deg)
+        dtau = _apply_inclination(dtau, los_axis, inclination_deg)
+
     # LOS radiative transfer: I(s+ds) = I(s)*exp(-dτ) + S*(1-exp(-dτ))
     nx, ny, nz = solver.density.shape
     if los_axis == 0:
@@ -444,10 +469,63 @@ def convolve_to_common_beam(maps, native_beams, target_beam_arcsec,
 # High-level observation generator
 # ============================================================
 
-def generate_observations(solver, distance_pc=414, los_axis=2):
+def _apply_inclination(data_3d, los_axis, inclination_deg):
+    """
+    Shear a 3D cube along the LOS to simulate an inclined viewing angle.
+
+    For a PDR viewed at a small angle from edge-on (like the Orion Bar
+    at ~4°), the stratified layers appear shifted in projection.  This
+    is implemented as a sub-pixel shear along the illumination axis (x)
+    as a function of position along the LOS (y).
+
+    Parameters
+    ----------
+    data_3d : ndarray (nx, ny, nz)
+        3D field to shear.
+    los_axis : int
+        LOS integration axis (0, 1, or 2).
+    inclination_deg : float
+        Inclination angle [degrees].  0 = perfectly edge-on.
+
+    Returns
+    -------
+    sheared : ndarray (nx, ny, nz)
+        Sheared 3D field.
+    """
+    if abs(inclination_deg) < 0.01:
+        return data_3d
+
+    from scipy.ndimage import shift as nd_shift
+    angle_rad = np.radians(inclination_deg)
+    tan_angle = np.tan(angle_rad)
+
+    n = data_3d.shape
+    sheared = np.empty_like(data_3d)
+
+    # Shear along x (axis 0) as function of position along LOS (los_axis)
+    n_los = n[los_axis]
+    for i_los in range(n_los):
+        # Pixel shift along x for this LOS slice
+        dx = tan_angle * (i_los - n_los / 2.0)
+
+        if los_axis == 0:
+            sl = data_3d[i_los, :, :]
+            sheared[i_los, :, :] = nd_shift(sl, [dx, 0], order=1, mode='constant')
+        elif los_axis == 1:
+            sl = data_3d[:, i_los, :]
+            sheared[:, i_los, :] = nd_shift(sl, [dx, 0], order=1, mode='constant')
+        else:
+            sl = data_3d[:, :, i_los]
+            sheared[:, :, i_los] = nd_shift(sl, [dx, 0], order=1, mode='constant')
+
+    return sheared
+
+
+def generate_observations(solver, distance_pc=414, los_axis=2,
+                          inclination_deg=0.0):
     """
     Generate a complete set of synthetic observations from a 3D model.
-    
+
     Parameters
     ----------
     solver : PDRSolver3D
@@ -456,28 +534,33 @@ def generate_observations(solver, distance_pc=414, los_axis=2):
         Distance to source [pc]. Default: 414 pc (Orion)
     los_axis : int
         Line-of-sight axis
-    
+    inclination_deg : float
+        Viewing inclination from edge-on [degrees].  For the Orion Bar,
+        ~4° (Hogerheijde+ 1995, Habart+ 2024).  0 = perfectly edge-on.
+
     Returns
     -------
     obs : dict
         Dictionary containing all maps, with metadata
     """
     obs = {}
-    
+    obs['inclination_deg'] = inclination_deg
+
     # Pixel size in arcsec
     pix_cm = solver.cell_size
     pix_arcsec = (pix_cm / (distance_pc * pc_cm)) * 206265
     obs['pixel_size_arcsec'] = pix_arcsec
     obs['distance_pc'] = distance_pc
-    
-    # Column densities
-    cols = column_density_maps(solver, los_axis)
+
+    # Column densities (with inclination applied)
+    cols = column_density_maps(solver, los_axis,
+                               inclination_deg=inclination_deg)
     obs.update(cols)
     
     # Dust continuum at key wavelengths
     for band_name, band in {**JWST_BANDS, **HERSCHEL_BANDS, **ALMA_BANDS}.items():
         lam = band['lam_um']
-        I_nu = dust_continuum_map(solver, lam, los_axis)
+        I_nu = dust_continuum_map(solver, lam, los_axis, inclination_deg)
         
         # Convert to MJy/sr for FIR, μJy/arcsec² for MIR
         if lam > 50:
@@ -492,7 +575,7 @@ def generate_observations(solver, distance_pc=414, los_axis=2):
     
     # Fine-structure lines (with beam convolution)
     for line_name in ['CII_158', 'OI_63', 'CI_609']:
-        I_line = line_emission_map(solver, line_name, los_axis)
+        I_line = line_emission_map(solver, line_name, los_axis, inclination_deg)
         obs[f'line_{line_name}'] = I_line
         beam = LINE_BEAMS.get(line_name, 1.0)
         obs[f'line_{line_name}_conv'] = convolve_beam(I_line, beam, pix_arcsec)
@@ -500,15 +583,23 @@ def generate_observations(solver, distance_pc=414, los_axis=2):
     # CO lines (J=1-0, 2-1, 3-2)
     for J in [1, 2, 3]:
         line_name = f'CO_{J}-{J-1}'
-        I_line = line_emission_map(solver, line_name, los_axis)
+        I_line = line_emission_map(solver, line_name, los_axis, inclination_deg)
         obs[f'line_{line_name}'] = I_line
         beam = LINE_BEAMS.get(line_name, 1.0)
         obs[f'line_{line_name}_conv'] = convolve_beam(I_line, beam, pix_arcsec)
-    
-    # Dust evolution maps (projected)
-    obs['f_nano_proj'] = np.mean(solver.f_nano, axis=los_axis)
-    obs['E_g_proj'] = np.mean(solver.E_g, axis=los_axis)
-    obs['Gamma_PE_proj'] = np.sum(solver.Gamma_PE, axis=los_axis) * solver.cell_size
+
+    # Dust evolution maps (projected, with inclination)
+    def _proj(field, method='mean'):
+        f = field
+        if abs(inclination_deg) > 0.01:
+            f = _apply_inclination(f, los_axis, inclination_deg)
+        if method == 'mean':
+            return np.mean(f, axis=los_axis)
+        return np.sum(f, axis=los_axis) * solver.cell_size
+
+    obs['f_nano_proj'] = _proj(solver.f_nano)
+    obs['E_g_proj'] = _proj(solver.E_g)
+    obs['Gamma_PE_proj'] = _proj(solver.Gamma_PE, method='sum')
     
     # Resolution diagnostic: which observables are resolved by this model?
     cell_AU = pix_arcsec * distance_pc
@@ -551,7 +642,7 @@ def plot_observations(obs, solver, savepath=None):
     fig = plt.figure(figsize=(24, 20))
     fig.suptitle('PRISM-3D Synthetic Observations\n'
                  f'3D Turbulent Cloud with THEMIS Dust Evolution '
-                 f'(G₀={solver.G0_external:.0f}, d={obs["distance_pc"]} pc)',
+                 f'(G₀={float(np.max(solver.G0_external)):.0f}, d={obs["distance_pc"]} pc)',
                  fontsize=15, fontweight='bold')
     
     gs = fig.add_gridspec(4, 5, hspace=0.35, wspace=0.4)
@@ -634,7 +725,7 @@ def plot_observations(obs, solver, savepath=None):
     ax.axis('off')
     info = (
         f"Model: {solver.nx}³ cells, {solver.box_size/pc_cm:.1f} pc\n"
-        f"G₀ = {solver.G0_external:.0f}, ζ_CR = {solver.zeta_CR_0:.1e} s⁻¹\n"
+        f"G₀ = {float(np.max(solver.G0_external)):.0f}, ζ_CR = {solver.zeta_CR_0:.1e} s⁻¹\n"
         f"n_H = {np.min(solver.density):.0f}–{np.max(solver.density):.0f} cm⁻³\n"
         f"T_gas = {np.min(solver.T_gas):.0f}–{np.max(solver.T_gas):.0f} K\n"
         f"T_dust = {np.min(solver.T_dust):.0f}–{np.max(solver.T_dust):.0f} K\n"

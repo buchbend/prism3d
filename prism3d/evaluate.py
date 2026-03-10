@@ -22,10 +22,11 @@ import json
 import time
 
 
-def evaluate_model(solver, output_dir='./results', distance_pc=414, verbose=True):
+def evaluate_model(solver, output_dir='./results', distance_pc=414,
+                   inclination_deg=0.0, verbose=True):
     """
     Run a complete evaluation suite on a converged PRISM-3D model.
-    
+
     Parameters
     ----------
     solver : PDRSolver3D
@@ -34,8 +35,10 @@ def evaluate_model(solver, output_dir='./results', distance_pc=414, verbose=True
         Directory for all outputs
     distance_pc : float
         Source distance for synthetic observations
+    inclination_deg : float
+        Viewing inclination from edge-on [degrees].
     verbose : bool
-    
+
     Returns
     -------
     report : dict
@@ -62,7 +65,8 @@ def evaluate_model(solver, output_dir='./results', distance_pc=414, verbose=True
     
     # 3. Generate synthetic observations
     from .observations.jwst_pipeline import generate_observations
-    obs = generate_observations(solver, distance_pc=distance_pc, los_axis=2)
+    obs = generate_observations(solver, distance_pc=distance_pc, los_axis=2,
+                                inclination_deg=inclination_deg)
     report['observations'] = {k: float(np.mean(v)) for k, v in obs.items()
                                if isinstance(v, np.ndarray) and v.ndim == 2}
     
@@ -123,7 +127,7 @@ def _model_summary(solver):
     s['n_cells'] = solver.n_cells
     s['box_pc'] = solver.box_size / pc_cm
     s['cell_pc'] = solver.cell_size / pc_cm
-    s['G0_external'] = solver.G0_external
+    s['G0_external'] = float(np.max(solver.G0_external))
     s['zeta_CR_0'] = solver.zeta_CR_0
     
     for name, arr in [

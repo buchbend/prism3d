@@ -252,6 +252,46 @@ def compute_ppv_cube(solver, line_name, los_axis=2,
     }
 
 
+def convolve_ppv_beam(ppv, beam_fwhm_arcsec, pixel_size_arcsec):
+    """
+    Convolve each velocity channel of a PPV cube with a Gaussian beam.
+
+    Parameters
+    ----------
+    ppv : dict
+        Output from compute_ppv_cube().
+    beam_fwhm_arcsec : float
+        Beam FWHM [arcsec].
+    pixel_size_arcsec : float
+        Pixel size [arcsec].
+
+    Returns
+    -------
+    convolved : dict
+        Same structure as ppv, with convolved 'cube' and 'tau_cube'.
+    """
+    from scipy.ndimage import gaussian_filter
+
+    sigma_pix = (beam_fwhm_arcsec / pixel_size_arcsec) / (2 * np.sqrt(2 * np.log(2)))
+    if sigma_pix < 0.5:
+        return ppv  # Beam smaller than pixel — no convolution needed
+
+    cube = ppv['cube'].copy()
+    tau_cube = ppv['tau_cube'].copy()
+    n_vel = cube.shape[2]
+
+    for iv in range(n_vel):
+        cube[:, :, iv] = gaussian_filter(cube[:, :, iv], sigma=sigma_pix)
+        tau_cube[:, :, iv] = gaussian_filter(tau_cube[:, :, iv], sigma=sigma_pix)
+
+    result = dict(ppv)
+    result['cube'] = cube
+    result['tau_cube'] = tau_cube
+    result['integrated_map'] = np.sum(cube, axis=2) * ppv['dv_kms']
+    result['beam_fwhm_arcsec'] = beam_fwhm_arcsec
+    return result
+
+
 def extract_spectrum(ppv, x_pix=None, y_pix=None, aperture_pix=None):
     """
     Extract a spectrum from a PPV cube.

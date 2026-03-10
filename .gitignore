@@ -20,3 +20,6 @@ results/
 *~
 .vscode/
 .idea/
+*.pyc
+*.so
+Cargo.*

@@ -2,6 +2,7 @@
 # Build, test, and deploy the 3D PDR code
 
 .PHONY: install test run clean container slurm train data help
+.PHONY: rust rust-test rust-clean install-rust
 
 PYTHON ?= python3
 N ?= 16
@@ -9,19 +10,29 @@ G0 ?= 500
 OUTPUT ?= ./results
 CONTAINER ?= prism3d.sif
 TRAIN_SAMPLES ?= 50000
+BIND_SRC ?= $(CURDIR)
+
+# Ensure Rust toolchain is in PATH (rustup default location)
+export PATH := $(HOME)/.cargo/bin:$(PATH)
 
 help:
-	@echo "PRISM-3D v0.5 — 3D PDR with THEMIS Dust Evolution"
+	@echo "PRISM-3D v0.6 — 3D PDR with THEMIS Dust Evolution + Rust Core"
 	@echo ""
 	@echo "Usage:"
-	@echo "  make install         Install PRISM-3D (editable)"
+	@echo "  make install         Install PRISM-3D with Rust core (maturin)"
+	@echo "  make install-python  Install Python-only (no Rust)"
+	@echo "  make rust            Build Rust core (release)"
+	@echo "  make rust-test       Run Rust unit tests"
 	@echo "  make test            Quick validation test (8³)"
+	@echo "  make test-parity     Run Rust vs Python parity tests"
 	@echo "  make run             Run model (N=$(N), G0=$(G0))"
 	@echo "  make run-orion       Run Orion Bar preset"
 	@echo "  make run-horsehead   Run Horsehead preset"
 	@echo "  make train           Train ML accelerator ($(TRAIN_SAMPLES) samples)"
 	@echo "  make data            Download PDRs4All Orion Bar data"
-	@echo "  make container       Build Apptainer/Singularity container"
+	@echo "  make container       Build Apptainer/Singularity container (with Rust)"
+	@echo "  make container-run   Run model inside container"
+	@echo "  make container-run-dev  Run with bind-mounted source (development)"
 	@echo "  make slurm           Generate SLURM submission scripts"
 	@echo "  make clean           Remove build artifacts"
 	@echo ""
@@ -33,20 +44,40 @@ help:
 
 # ── Installation ──────────────────────────────────────────
 
-install:
-	$(PYTHON) -m pip install -e .
+install: rust
+	@echo "PRISM-3D installed with Rust core"
 
-install-hpc:
-	$(PYTHON) -m pip install -e ".[hpc]"
+rust:
+	maturin develop --release
 
-install-all:
-	$(PYTHON) -m pip install -e ".[all]"
+install-python:
+	@echo "Installing Python-only (no Rust core)..."
+	$(PYTHON) -m pip install -e . --no-build-isolation 2>/dev/null || \
+	$(PYTHON) -m pip install numpy scipy matplotlib scikit-learn && \
+	echo "Python-only install complete (Rust core not available)"
+
+install-hpc: rust
+	$(PYTHON) -m pip install mpi4py h5py cupy-cuda12x
+
+install-all: rust
+	$(PYTHON) -m pip install mpi4py h5py astropy
+
+# ── Rust ─────────────────────────────────────────────────
+
+rust-test:
+	cargo test --manifest-path rust/Cargo.toml
+
+rust-clean:
+	cargo clean --manifest-path Cargo.toml
 
 # ── Running ───────────────────────────────────────────────
 
 test:
 	$(PYTHON) -m prism3d.run --n 8 --G0 100 --output ./test_output
 	@echo "Test complete. Check ./test_output/"
+
+test-parity:
+	$(PYTHON) -m pytest prism3d/tests/test_rust_parity.py -v -s
 
 run:
 	$(PYTHON) -m prism3d.run --n $(N) --G0 $(G0) --output $(OUTPUT)
@@ -89,13 +120,31 @@ data-prepare:
 # ── Container ─────────────────────────────────────────────
 
 container:
-	apptainer build --fakeroot $(CONTAINER) apptainer.def
+	apptainer build --force --fakeroot $(CONTAINER) apptainer.def
 
 container-run:
-	apptainer run $(CONTAINER) --n $(N) --G0 $(G0) --output $(OUTPUT)
+	@mkdir -p $(OUTPUT)
+	apptainer run --cleanenv --no-mount home --bind $$(realpath $(OUTPUT)):/output \
+		$(CONTAINER) --n $(N) --G0 $(G0) --output /output
+
+container-run-dev:
+	@mkdir -p $(OUTPUT)
+	apptainer run --cleanenv --no-mount home \
+		--bind $(BIND_SRC)/prism3d:/opt/prism3d/prism3d \
+		--bind $$(realpath $(OUTPUT)):/output \
+		$(CONTAINER) --n $(N) --G0 $(G0) --output /output
 
 container-shell:
-	apptainer shell $(CONTAINER)
+	apptainer shell --cleanenv --no-mount home $(CONTAINER)
+
+container-train:
+	apptainer exec --cleanenv --no-mount home --bind $(CURDIR):/work \
+		$(CONTAINER) python -m prism3d.chemistry.train_hpc \
+		--n-samples $(TRAIN_SAMPLES) --output /work/training_data_$(TRAIN_SAMPLES).npz
+	apptainer exec --cleanenv --no-mount home --bind $(CURDIR):/work \
+		$(CONTAINER) python -m prism3d.chemistry.train_hpc \
+		--train --data /work/training_data_$(TRAIN_SAMPLES).npz \
+		--save /work/accelerator_$(TRAIN_SAMPLES).pkl
 
 # ── SLURM ─────────────────────────────────────────────────
 
@@ -116,6 +165,6 @@ clean:
 	find . -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 	find . -name "*.pyc" -delete 2>/dev/null || true
 
-clean-all: clean
+clean-all: clean rust-clean
 	rm -rf test_output/ results/ orion_bar_data/ prepared/
 	rm -f *.slurm *.pkl training_data_*.npz

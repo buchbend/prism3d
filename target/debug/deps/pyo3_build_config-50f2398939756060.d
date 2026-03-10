@@ -1,0 +1,14 @@
+/home/buchbend/git/git.ph1.uni-koeln.de/prism3d/target/debug/deps/pyo3_build_config-50f2398939756060.d: /home/buchbend/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pyo3-build-config-0.24.2/src/lib.rs /home/buchbend/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pyo3-build-config-0.24.2/src/errors.rs /home/buchbend/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pyo3-build-config-0.24.2/src/impl_.rs /home/buchbend/git/git.ph1.uni-koeln.de/prism3d/target/debug/build/pyo3-build-config-ac91b027e6f11de4/out/pyo3-build-config-file.txt /home/buchbend/git/git.ph1.uni-koeln.de/prism3d/target/debug/build/pyo3-build-config-ac91b027e6f11de4/out/pyo3-build-config.txt
+
+/home/buchbend/git/git.ph1.uni-koeln.de/prism3d/target/debug/deps/libpyo3_build_config-50f2398939756060.rlib: /home/buchbend/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pyo3-build-config-0.24.2/src/lib.rs /home/buchbend/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pyo3-build-config-0.24.2/src/errors.rs /home/buchbend/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pyo3-build-config-0.24.2/src/impl_.rs /home/buchbend/git/git.ph1.uni-koeln.de/prism3d/target/debug/build/pyo3-build-config-ac91b027e6f11de4/out/pyo3-build-config-file.txt /home/buchbend/git/git.ph1.uni-koeln.de/prism3d/target/debug/build/pyo3-build-config-ac91b027e6f11de4/out/pyo3-build-config.txt
+
+/home/buchbend/git/git.ph1.uni-koeln.de/prism3d/target/debug/deps/libpyo3_build_config-50f2398939756060.rmeta: /home/buchbend/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pyo3-build-config-0.24.2/src/lib.rs /home/buchbend/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pyo3-build-config-0.24.2/src/errors.rs /home/buchbend/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pyo3-build-config-0.24.2/src/impl_.rs /home/buchbend/git/git.ph1.uni-koeln.de/prism3d/target/debug/build/pyo3-build-config-ac91b027e6f11de4/out/pyo3-build-config-file.txt /home/buchbend/git/git.ph1.uni-koeln.de/prism3d/target/debug/build/pyo3-build-config-ac91b027e6f11de4/out/pyo3-build-config.txt
+
+/home/buchbend/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pyo3-build-config-0.24.2/src/lib.rs:
+/home/buchbend/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pyo3-build-config-0.24.2/src/errors.rs:
+/home/buchbend/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/pyo3-build-config-0.24.2/src/impl_.rs:
+/home/buchbend/git/git.ph1.uni-koeln.de/prism3d/target/debug/build/pyo3-build-config-ac91b027e6f11de4/out/pyo3-build-config-file.txt:
+/home/buchbend/git/git.ph1.uni-koeln.de/prism3d/target/debug/build/pyo3-build-config-ac91b027e6f11de4/out/pyo3-build-config.txt:
+
+# env-dep:CARGO_PKG_VERSION=0.24.2
+# env-dep:OUT_DIR=/home/buchbend/git/git.ph1.uni-koeln.de/prism3d/target/debug/build/pyo3-build-config-ac91b027e6f11de4/out

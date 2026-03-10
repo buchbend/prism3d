@@ -18,10 +18,11 @@ import base64
 import os
 
 
-def export_viewer(solver, output_path='viewer.html', title=None, mode='auto'):
+def export_viewer(solver, output_path='viewer.html', title=None, mode='auto',
+                  distance_pc=414.0):
     """
     Export a PRISM-3D model as an interactive 3D HTML viewer.
-    
+
     Parameters
     ----------
     solver : PDRSolver3D
@@ -34,12 +35,14 @@ def export_viewer(solver, output_path='viewer.html', title=None, mode='auto'):
         'threejs'  — Three.js WebGL (real volume raycasting, requires CDN)
         'canvas'   — Canvas2D fallback (no CDN, works offline)
         'auto'     — Three.js with Canvas2D fallback if loading fails
+    distance_pc : float
+        Source distance [pc] for angular size calculation (default: 414 for Orion Bar).
     """
     from .utils.constants import pc_cm
     
     if title is None:
         title = (f"PRISM-3D: {solver.nx}³ cells, "
-                 f"G₀={solver.G0_external:.0f}, "
+                 f"G₀={float(np.max(solver.G0_external)):.0f}, "
                  f"{solver.box_size/pc_cm:.2f} pc")
     
     # Prepare data: downsample if > 32³ for browser performance
@@ -83,7 +86,7 @@ def export_viewer(solver, output_path='viewer.html', title=None, mode='auto'):
     model_json = {
         'N': n_out,
         'box_pc': solver.box_size / pc_cm,
-        'G0_ext': solver.G0_external,
+        'G0_ext': float(np.max(solver.G0_external)),
     }
     
     for key, meta in tracers.items():
@@ -115,26 +118,57 @@ def export_viewer(solver, output_path='viewer.html', title=None, mode='auto'):
             'pp': ranges['lin'],   # [vmin, vmax] for linear scale
         }
     
-    # Compute PPV spectra for key lines
+    # Compute PPV spectra for key lines (with optional velocity field + beam convolution)
     try:
-        from .observations.spectra import compute_ppv_cube
+        from .observations.spectra import compute_ppv_cube, convolve_ppv_beam
+        from .observations.jwst_pipeline import LINE_BEAMS
         spec_lines = ['CII_158', 'OI_63', 'CI_609', 'CO_1-0', 'CO_2-1', 'CO_3-2']
-        spec_colors = ['#ff3333', '#33aaff', '#ff9900', '#33cc55', '#22aa44', '#118833']
+        spec_colors = ['rgb(255,50,50)', 'rgb(50,170,255)', 'rgb(255,153,0)', 'rgb(50,200,85)', 'rgb(34,170,68)', 'rgb(17,136,51)']
         n_vel_viewer = 32
+
+        # Extract LOS velocity component (axis=2 by default)
+        v_los = None
+        if solver.velocity_field is not None:
+            v_los = solver.velocity_field[2]  # z-component for los_axis=2
+
+        # Auto-adjust velocity range based on velocity field
+        vel_range_kms = 8.0
+        if v_los is not None:
+            v_rms_kms = np.sqrt(np.mean(v_los**2)) / 1e5
+            vel_range_kms = max(8.0, 3.0 * v_rms_kms)
+
+        # Pixel angular size
+        box_pc = solver.box_size / pc_cm
+        pixel_arcsec = (box_pc / n_out) / distance_pc * 206265.0
+
         spectra_data = {}
         for i, ln in enumerate(spec_lines):
             try:
                 ppv = compute_ppv_cube(solver, ln, los_axis=2,
-                                       n_vel=n_vel_viewer, vel_range_kms=8.0)
-                # Store: velocity axis + 2D array of spectra (n1*n2, n_vel)
+                                       n_vel=n_vel_viewer,
+                                       vel_range_kms=vel_range_kms,
+                                       velocity_field=v_los)
+                # Native cube
                 cube = ppv['cube'].astype(np.float32)
-                # Downsample spatially to match viewer grid
                 if step > 1:
                     cube = cube[::step, ::step, :]
-                spectra_data[ln] = {
+
+                entry = {
                     's': cube.reshape(-1, n_vel_viewer).tolist(),
                     'c': spec_colors[i],
                 }
+
+                # Beam-convolved version
+                beam_fwhm = LINE_BEAMS.get(ln, 0)
+                if beam_fwhm > 0 and pixel_arcsec > 0:
+                    ppv_conv = convolve_ppv_beam(ppv, beam_fwhm, pixel_arcsec)
+                    cube_conv = ppv_conv['cube'].astype(np.float32)
+                    if step > 1:
+                        cube_conv = cube_conv[::step, ::step, :]
+                    entry['sb'] = cube_conv.reshape(-1, n_vel_viewer).tolist()
+                    entry['beam'] = round(beam_fwhm, 2)
+
+                spectra_data[ln] = entry
             except Exception:
                 pass
         if spectra_data:
@@ -143,8 +177,11 @@ def export_viewer(solver, output_path='viewer.html', title=None, mode='auto'):
                 'vel': vel_axis,
                 'lines': spectra_data,
                 'n_vel': n_vel_viewer,
+                'pixel_arcsec': round(pixel_arcsec, 3),
             }
             print(f"  Spectra: {list(spectra_data.keys())}")
+            if v_los is not None:
+                print(f"  Velocity field: v_rms={np.sqrt(np.mean(v_los**2))/1e5:.2f} km/s")
     except ImportError:
         pass
 
@@ -192,14 +229,15 @@ canvas{{border-radius:8px}}
     <span id="cmax" style="font-size:10px;color:#78909c;font-family:monospace"></span>
   </div>
   <div style="font-size:9px;color:#3a4a5a;text-align:center">Drag to rotate/tilt · Click slice to show spectra</div>
-  <div id="specPanel" style="display:none;background:#0d0d18;border-radius:10px;border:1px solid rgba(100,180,255,.08);padding:8px;margin-top:4px">
-    <div style="display:flex;justify-content:space-between;align-items:center"><div class="lbl" style="margin:0">Line Profiles <span id="specPos" style="color:#607080;font-weight:400"></span></div><div id="specLegend" style="font-size:10px"></div></div>
-    <canvas id="specCv" style="width:100%;height:140px;cursor:crosshair"></canvas>
+  <div id="specPanel" style="display:none;background:#0d0d18;border-radius:10px;border:1px solid rgba(100,180,255,.08);padding:6px 8px;margin-top:4px">
+    <div class="lbl" style="margin:0 0 4px 0">Line Profiles <span id="specPos" style="color:#607080;font-weight:400"></span></div>
+    <canvas id="specCv" style="width:100%;height:120px;cursor:pointer"></canvas>
   </div>
 </div>
 <div id="panel">
   <div><div class="lbl">Tracer</div><div id="trbtn" class="btns"></div></div>
   <div><div class="lbl">View</div><div class="btns"><button class="btn on" onclick="setVw('vol')">Volume</button><button class="btn" onclick="setVw('slc')">Slice</button></div></div>
+  <div id="obsDiv"><div class="lbl">Observation</div><div class="btns"><button class="btn on" id="obsNat" onclick="setObs(false)">Native</button><button class="btn" id="obsBeam" onclick="setObs(true)">Beam-conv</button></div><div id="beamInfo" style="font-size:9px;color:#607080;margin-top:3px"></div></div>
   <div><div class="lbl">Scale</div><div class="btns"><button class="btn" id="sLog" onclick="setScale('log')">Log</button><button class="btn" id="sLin" onclick="setScale('linear')">Linear</button><button class="btn on" id="sAuto" onclick="setScale('auto')">Auto</button></div></div>
   <div><div class="lbl">Range</div>
     <div style="display:flex;gap:4px;align-items:center"><span style="font-size:10px;width:28px">Min</span><input type="number" id="rMin" step="any" style="flex:1;background:rgba(20,30,50,.6);border:1px solid rgba(100,180,255,.15);border-radius:4px;color:#90a4ae;font-size:10px;padding:3px;font-family:monospace" onchange="setRange()"></div>
@@ -247,36 +285,81 @@ function setTr(k){{tr=k;userMin=null;userMax=null;document.querySelectorAll('#tr
 function setVw(v){{vw=v;document.getElementById('volctl').style.display=v==='vol'?'':'none';document.getElementById('slcctl').style.display=v==='slc'?'':'none';paint();}}
 function setSA(a){{sax=a;paint();}}
 const tb=document.getElementById('trbtn');for(const k of Object.keys(M)){{const b=document.createElement('button');b.className='btn'+(k===tr?' on':'');b.textContent=M[k].label;b.dataset.k=k;b.onclick=()=>setTr(k);tb.appendChild(b);}}
-// Spectra
+// Spectra — individual panels per line with observation mode
 const SP=RAW.spectra;
 const specCv=document.getElementById('specCv'),specCtx=specCv?specCv.getContext('2d'):null;
+let selLine=null,specPx=-1,specPy=-1,obsMode=false;
+const lineKeys=SP?Object.keys(SP.lines):[];
+const hasBeam=SP&&lineKeys.some(k=>SP.lines[k].sb);
+if(!hasBeam)document.getElementById('obsDiv').style.display='none';
+function setObs(on){{obsMode=on;document.getElementById('obsNat').classList.toggle('on',!on);document.getElementById('obsBeam').classList.toggle('on',on);const bi=document.getElementById('beamInfo');if(on&&selLine&&SP.lines[selLine]&&SP.lines[selLine].beam)bi.textContent='Beam: '+SP.lines[selLine].beam+'"';else bi.textContent='';if(specPx>=0)drawSpec(specPx,specPy);}}
+function fmtI(v){{if(v===0)return'0';const e=Math.floor(Math.log10(Math.abs(v)));if(e>=-1&&e<=2)return v.toPrecision(2);return v.toExponential(1);}}
+function specFWHM(s,vel,nv){{let pk=0;for(let i=0;i<nv;i++)if(s[i]>pk)pk=s[i];if(pk<=0)return 0;const hm=pk/2;let i0=-1,i1=-1;for(let i=0;i<nv;i++)if(s[i]>=hm){{if(i0<0)i0=i;i1=i;}};return i1>i0?(vel[i1]-vel[i0]):0;}}
+function specInteg(s,dv,nv){{let sum=0;for(let i=0;i<nv;i++)sum+=s[i];return sum*dv;}}
 function drawSpec(px,py){{
-  if(!SP||!specCtx)return;
+  if(!SP||!specCtx)return;specPx=px;specPy=py;
   document.getElementById('specPanel').style.display='';
   specCv.width=specCv.parentElement.clientWidth;specCv.height=140;
-  const W=specCv.width,H=specCv.height,pad=30,pR=10;
-  const vel=SP.vel,nv=SP.n_vel,idx=py*N+px;
+  const W=specCv.width,H=specCv.height;
+  const vel=SP.vel,nv=SP.n_vel,idx=py*N+px,nL=lineKeys.length;
+  if(nL===0)return;
+  const dv=vel.length>1?vel[1]-vel[0]:1;
   document.getElementById('specPos').textContent='pixel ('+px+', '+py+')';
-  let gmax=0;
-  for(const[ln,ld]of Object.entries(SP.lines)){{const s=ld.s[idx];if(!s)continue;for(let i=0;i<nv;i++)if(s[i]>gmax)gmax=s[i];}}
-  if(gmax<=0)gmax=1;
+  const pw=W/nL,pt=16,pb=28,pl=6,pr=2,pH=H-pt-pb;
   specCtx.fillStyle='#0d0d18';specCtx.fillRect(0,0,W,H);
-  specCtx.strokeStyle='#2a3a4a';specCtx.lineWidth=1;
-  specCtx.beginPath();specCtx.moveTo(pad,5);specCtx.lineTo(pad,H-18);specCtx.lineTo(W-pR,H-18);specCtx.stroke();
-  specCtx.fillStyle='#506070';specCtx.font='9px monospace';specCtx.textAlign='center';
-  for(let i=0;i<=4;i++){{const v=vel[Math.floor(i*(nv-1)/4)];specCtx.fillText(v.toFixed(1),pad+(W-pad-pR)*i/4,H-5);}}
-  specCtx.fillText('v [km/s]',(W+pad-pR)/2,H);
-  specCtx.save();specCtx.translate(8,(H-18)/2);specCtx.rotate(-Math.PI/2);specCtx.textAlign='center';specCtx.fillText('I',0,0);specCtx.restore();
-  let legend='';
-  for(const[ln,ld]of Object.entries(SP.lines)){{
-    const s=ld.s[idx];if(!s)continue;
+  for(let li=0;li<nL;li++){{
+    const ln=lineKeys[li],ld=SP.lines[ln],s=ld.s[idx],sb=ld.sb?ld.sb[idx]:null;
+    const x0=li*pw+pl,x1=(li+1)*pw-pr,w=x1-x0;
+    // Determine which spectrum to show as primary
+    const sPrimary=obsMode&&sb?sb:s;
+    const sSecondary=obsMode&&sb?s:null;
+    // Per-line max (from both native and convolved for consistent scale)
+    let lmax=0;if(s)for(let i=0;i<nv;i++)if(s[i]>lmax)lmax=s[i];
+    if(sb)for(let i=0;i<nv;i++)if(sb[i]>lmax)lmax=sb[i];
+    if(lmax<=0)lmax=1;
+    // Selected highlight
+    if(ln===selLine){{specCtx.fillStyle='rgba(33,150,243,.1)';specCtx.fillRect(li*pw,0,pw,H);specCtx.strokeStyle='#2196f3';specCtx.lineWidth=1.5;specCtx.strokeRect(li*pw+.5,.5,pw-1,H-1);}}
+    // Label + beam indicator
+    specCtx.fillStyle=ld.c;specCtx.font='bold 9px system-ui';specCtx.textAlign='center';
+    const beamStr=ld.beam&&obsMode?' ['+ld.beam+'"]':'';
+    specCtx.fillText(ln+beamStr,x0+w/2,11);
+    // Axes
+    specCtx.strokeStyle='#1e2e3e';specCtx.lineWidth=.5;
+    specCtx.beginPath();specCtx.moveTo(x0,pt);specCtx.lineTo(x0,pt+pH);specCtx.lineTo(x1,pt+pH);specCtx.stroke();
+    // Peak intensity label
+    specCtx.fillStyle='#506070';specCtx.font='8px monospace';specCtx.textAlign='left';
+    specCtx.fillText(fmtI(lmax),x0+1,pt+8);
+    // Velocity labels
+    if(li===0||li===nL-1||nL<=3){{
+      specCtx.fillStyle='#405060';specCtx.font='7px monospace';specCtx.textAlign='center';
+      specCtx.fillText(vel[0].toFixed(0),x0,pt+pH+10);
+      specCtx.fillText(vel[nv-1].toFixed(0),x1,pt+pH+10);
+    }}
+    if(!sPrimary)continue;
+    // Draw secondary (dashed) if in obs mode
+    if(sSecondary){{specCtx.strokeStyle=ld.c.replace(')',',0.35)').replace('rgb','rgba');specCtx.lineWidth=1;specCtx.setLineDash([3,3]);specCtx.beginPath();for(let i=0;i<nv;i++){{const x=x0+w*i/(nv-1),y=pt+pH*(1-sSecondary[i]/lmax);if(i===0)specCtx.moveTo(x,y);else specCtx.lineTo(x,y);}}specCtx.stroke();specCtx.setLineDash([]);}}
+    // Draw primary (solid)
     specCtx.strokeStyle=ld.c;specCtx.lineWidth=1.5;specCtx.beginPath();
-    for(let i=0;i<nv;i++){{const x=pad+(W-pad-pR)*i/(nv-1),y=5+(H-23)*(1-s[i]/gmax);if(i===0)specCtx.moveTo(x,y);else specCtx.lineTo(x,y);}}
-    specCtx.stroke();
-    legend+='<span style="color:'+ld.c+';margin-left:6px">\u25CF '+ln+'</span>';
+    for(let i=0;i<nv;i++){{
+      const x=x0+w*i/(nv-1),y=pt+pH*(1-sPrimary[i]/lmax);
+      if(i===0)specCtx.moveTo(x,y);else specCtx.lineTo(x,y);
+    }}specCtx.stroke();
+    specCtx.lineTo(x1,pt+pH);specCtx.lineTo(x0,pt+pH);specCtx.closePath();
+    specCtx.fillStyle=ld.c.replace(')',',0.08)').replace('rgb','rgba');
+    specCtx.fill();
+    // Line parameter annotations
+    const pk=Math.max(...sPrimary),fw=specFWHM(sPrimary,vel,nv),intg=specInteg(sPrimary,dv,nv);
+    specCtx.fillStyle='#607080';specCtx.font='7px monospace';specCtx.textAlign='center';
+    specCtx.fillText('pk:'+fmtI(pk)+' fw:'+fw.toFixed(1)+' I:'+fmtI(intg),x0+w/2,H-2);
   }}
-  document.getElementById('specLegend').innerHTML=legend;
 }}
+specCv.addEventListener('click',e=>{{
+  if(!SP||lineKeys.length===0)return;
+  const rect=specCv.getBoundingClientRect();
+  const fx=(e.clientX-rect.left)/rect.width;
+  const li=Math.floor(fx*lineKeys.length);
+  if(li>=0&&li<lineKeys.length){{selLine=lineKeys[li];const ld=SP.lines[selLine];const bi=document.getElementById('beamInfo');if(obsMode&&ld&&ld.beam)bi.textContent='Beam: '+ld.beam+'"';else bi.textContent='';drawSpec(specPx,specPy);}}
+}});
 cv.addEventListener('click',e=>{{
   if(vw!=='slc')return;
   const rect=cv.getBoundingClientRect();
@@ -314,9 +397,9 @@ body{{background:#0a0a12;color:#e0e0e0;font-family:system-ui;display:flex;height
     <span id="cmax" style="font-size:10px;color:#78909c;font-family:monospace"></span>
   </div>
   <div style="font-size:9px;color:#3a4a5a;text-align:center">Drag: rotate · Scroll: zoom · Shift+drag: pan · Click slice for spectra</div>
-  <div id="specPanel" style="display:none;background:#0d0d18;border-radius:10px;border:1px solid rgba(100,180,255,.08);padding:8px;margin-top:4px">
-    <div style="display:flex;justify-content:space-between;align-items:center"><div class="lbl" style="margin:0">Line Profiles <span id="specPos" style="color:#607080;font-weight:400"></span></div><div id="specLegend" style="font-size:10px"></div></div>
-    <canvas id="specCv" style="width:100%;height:140px;cursor:crosshair"></canvas>
+  <div id="specPanel" style="display:none;background:#0d0d18;border-radius:10px;border:1px solid rgba(100,180,255,.08);padding:6px 8px;margin-top:4px">
+    <div class="lbl" style="margin:0 0 4px 0">Line Profiles <span id="specPos" style="color:#607080;font-weight:400"></span></div>
+    <canvas id="specCv" style="width:100%;height:120px;cursor:pointer"></canvas>
   </div>
 </div>
 <div id="panel">
@@ -327,6 +410,7 @@ body{{background:#0a0a12;color:#e0e0e0;font-family:system-ui;display:flex;height
     <button class="btn" id="mSlc" onclick="setMode('slice')">Slice</button>
     <button class="btn" id="mIso" onclick="setMode('iso')">Isosurface</button>
   </div></div>
+  <div id="obsDiv"><div class="lbl">Observation</div><div class="btns"><button class="btn on" id="obsNat" onclick="setObs(false)">Native</button><button class="btn" id="obsBeam" onclick="setObs(true)">Beam-conv</button></div><div id="beamInfo" style="font-size:9px;color:#607080;margin-top:3px"></div></div>
   <div id="cmpDiv" style="display:none"><div class="lbl">Overlay tracers</div><div id="cmpbtns" class="btns"></div></div>
   <div><div class="lbl">Scale</div><div class="btns"><button class="btn" id="sLog" onclick="setScale('log')">Log</button><button class="btn" id="sLin" onclick="setScale('linear')">Linear</button><button class="btn on" id="sAuto" onclick="setScale('auto')">Auto</button></div></div>
   <div><div class="lbl">Range</div>
@@ -536,36 +620,71 @@ const tb=document.getElementById('trbtn');for(const k of Object.keys(M)){{const 
 // Composite toggle buttons
 const cb=document.getElementById('cmpbtns');for(const k of Object.keys(M)){{const c=M[k].rgb;const b=document.createElement('button');b.className='btn'+(cmpSel.has(k)?' on':'');b.innerHTML='\u25CF '+M[k].label;b.style.color='rgb('+c[0]+','+c[1]+','+c[2]+')';b.onclick=function(){{toggleCmp(k,this)}};cb.appendChild(b);}}
 
-// Spectra
+// Spectra — individual panels per line with observation mode
 const SP=RAW.spectra;
 const specCv=document.getElementById('specCv'),specCtx=specCv?specCv.getContext('2d'):null;
+let selLine=null,specPx=-1,specPy=-1,obsMode=false;
+const lineKeys=SP?Object.keys(SP.lines):[];
+const hasBeam=SP&&lineKeys.some(k=>SP.lines[k].sb);
+if(!hasBeam)document.getElementById('obsDiv').style.display='none';
+function setObs(on){{obsMode=on;document.getElementById('obsNat').classList.toggle('on',!on);document.getElementById('obsBeam').classList.toggle('on',on);const bi=document.getElementById('beamInfo');if(on&&selLine&&SP.lines[selLine]&&SP.lines[selLine].beam)bi.textContent='Beam: '+SP.lines[selLine].beam+'"';else bi.textContent='';if(specPx>=0)drawSpec(specPx,specPy);}}
+function fmtI(v){{if(v===0)return'0';const e=Math.floor(Math.log10(Math.abs(v)));if(e>=-1&&e<=2)return v.toPrecision(2);return v.toExponential(1);}}
+function specFWHM(s,vel,nv){{let pk=0;for(let i=0;i<nv;i++)if(s[i]>pk)pk=s[i];if(pk<=0)return 0;const hm=pk/2;let i0=-1,i1=-1;for(let i=0;i<nv;i++)if(s[i]>=hm){{if(i0<0)i0=i;i1=i;}};return i1>i0?(vel[i1]-vel[i0]):0;}}
+function specInteg(s,dv,nv){{let sum=0;for(let i=0;i<nv;i++)sum+=s[i];return sum*dv;}}
 function drawSpec(px,py){{
-  if(!SP||!specCtx)return;
+  if(!SP||!specCtx)return;specPx=px;specPy=py;
   document.getElementById('specPanel').style.display='';
   specCv.width=specCv.parentElement.clientWidth;specCv.height=140;
-  const W=specCv.width,H=specCv.height,pad=30,pR=10;
-  const vel=SP.vel,nv=SP.n_vel,idx=py*N+px;
+  const W=specCv.width,H=specCv.height;
+  const vel=SP.vel,nv=SP.n_vel,idx=py*N+px,nL=lineKeys.length;
+  if(nL===0)return;
+  const dv=vel.length>1?vel[1]-vel[0]:1;
   document.getElementById('specPos').textContent='pixel ('+px+', '+py+')';
-  let gmax=0;
-  for(const[ln,ld]of Object.entries(SP.lines)){{const s=ld.s[idx];if(!s)continue;for(let i=0;i<nv;i++)if(s[i]>gmax)gmax=s[i];}}
-  if(gmax<=0)gmax=1;
+  const pw=W/nL,pt=16,pb=28,pl=6,pr=2,pH=H-pt-pb;
   specCtx.fillStyle='#0d0d18';specCtx.fillRect(0,0,W,H);
-  specCtx.strokeStyle='#2a3a4a';specCtx.lineWidth=1;
-  specCtx.beginPath();specCtx.moveTo(pad,5);specCtx.lineTo(pad,H-18);specCtx.lineTo(W-pR,H-18);specCtx.stroke();
-  specCtx.fillStyle='#506070';specCtx.font='9px monospace';specCtx.textAlign='center';
-  for(let i=0;i<=4;i++){{const v=vel[Math.floor(i*(nv-1)/4)];specCtx.fillText(v.toFixed(1),pad+(W-pad-pR)*i/4,H-5);}}
-  specCtx.fillText('v [km/s]',(W+pad-pR)/2,H);
-  specCtx.save();specCtx.translate(8,(H-18)/2);specCtx.rotate(-Math.PI/2);specCtx.textAlign='center';specCtx.fillText('I',0,0);specCtx.restore();
-  let legend='';
-  for(const[ln,ld]of Object.entries(SP.lines)){{
-    const s=ld.s[idx];if(!s)continue;
+  for(let li=0;li<nL;li++){{
+    const ln=lineKeys[li],ld=SP.lines[ln],s=ld.s[idx],sb=ld.sb?ld.sb[idx]:null;
+    const x0=li*pw+pl,x1=(li+1)*pw-pr,w=x1-x0;
+    const sPrimary=obsMode&&sb?sb:s;
+    const sSecondary=obsMode&&sb?s:null;
+    let lmax=0;if(s)for(let i=0;i<nv;i++)if(s[i]>lmax)lmax=s[i];
+    if(sb)for(let i=0;i<nv;i++)if(sb[i]>lmax)lmax=sb[i];
+    if(lmax<=0)lmax=1;
+    if(ln===selLine){{specCtx.fillStyle='rgba(33,150,243,.1)';specCtx.fillRect(li*pw,0,pw,H);specCtx.strokeStyle='#2196f3';specCtx.lineWidth=1.5;specCtx.strokeRect(li*pw+.5,.5,pw-1,H-1);}}
+    specCtx.fillStyle=ld.c;specCtx.font='bold 9px system-ui';specCtx.textAlign='center';
+    const beamStr=ld.beam&&obsMode?' ['+ld.beam+'"]':'';
+    specCtx.fillText(ln+beamStr,x0+w/2,11);
+    specCtx.strokeStyle='#1e2e3e';specCtx.lineWidth=.5;
+    specCtx.beginPath();specCtx.moveTo(x0,pt);specCtx.lineTo(x0,pt+pH);specCtx.lineTo(x1,pt+pH);specCtx.stroke();
+    specCtx.fillStyle='#506070';specCtx.font='8px monospace';specCtx.textAlign='left';
+    specCtx.fillText(fmtI(lmax),x0+1,pt+8);
+    if(li===0||li===nL-1||nL<=3){{
+      specCtx.fillStyle='#405060';specCtx.font='7px monospace';specCtx.textAlign='center';
+      specCtx.fillText(vel[0].toFixed(0),x0,pt+pH+10);
+      specCtx.fillText(vel[nv-1].toFixed(0),x1,pt+pH+10);
+    }}
+    if(!sPrimary)continue;
+    if(sSecondary){{specCtx.strokeStyle=ld.c.replace(')',',0.35)').replace('rgb','rgba');specCtx.lineWidth=1;specCtx.setLineDash([3,3]);specCtx.beginPath();for(let i=0;i<nv;i++){{const x=x0+w*i/(nv-1),y=pt+pH*(1-sSecondary[i]/lmax);if(i===0)specCtx.moveTo(x,y);else specCtx.lineTo(x,y);}}specCtx.stroke();specCtx.setLineDash([]);}}
     specCtx.strokeStyle=ld.c;specCtx.lineWidth=1.5;specCtx.beginPath();
-    for(let i=0;i<nv;i++){{const x=pad+(W-pad-pR)*i/(nv-1),y=5+(H-23)*(1-s[i]/gmax);if(i===0)specCtx.moveTo(x,y);else specCtx.lineTo(x,y);}}
-    specCtx.stroke();
-    legend+='<span style="color:'+ld.c+';margin-left:6px">\u25CF '+ln+'</span>';
+    for(let i=0;i<nv;i++){{
+      const x=x0+w*i/(nv-1),y=pt+pH*(1-sPrimary[i]/lmax);
+      if(i===0)specCtx.moveTo(x,y);else specCtx.lineTo(x,y);
+    }}specCtx.stroke();
+    specCtx.lineTo(x1,pt+pH);specCtx.lineTo(x0,pt+pH);specCtx.closePath();
+    specCtx.fillStyle=ld.c.replace(')',',0.08)').replace('rgb','rgba');
+    specCtx.fill();
+    const pk=Math.max(...sPrimary),fw=specFWHM(sPrimary,vel,nv),intg=specInteg(sPrimary,dv,nv);
+    specCtx.fillStyle='#607080';specCtx.font='7px monospace';specCtx.textAlign='center';
+    specCtx.fillText('pk:'+fmtI(pk)+' fw:'+fw.toFixed(1)+' I:'+fmtI(intg),x0+w/2,H-2);
   }}
-  document.getElementById('specLegend').innerHTML=legend;
 }}
+specCv.addEventListener('click',e=>{{
+  if(!SP||lineKeys.length===0)return;
+  const rect=specCv.getBoundingClientRect();
+  const fx=(e.clientX-rect.left)/rect.width;
+  const li=Math.floor(fx*lineKeys.length);
+  if(li>=0&&li<lineKeys.length){{selLine=lineKeys[li];const ld=SP.lines[selLine];const bi=document.getElementById('beamInfo');if(obsMode&&ld&&ld.beam)bi.textContent='Beam: '+ld.beam+'"';else bi.textContent='';drawSpec(specPx,specPy);}}
+}});
 // Raycast click on slice
 const raycaster=new THREE.Raycaster();
 ren.domElement.addEventListener('click',e=>{{

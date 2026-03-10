@@ -26,6 +26,7 @@ help:
 	@echo "  make run             Run model (N=$(N), G0=$(G0))"
 	@echo "  make run-orion       Run Orion Bar preset"
 	@echo "  make run-horsehead   Run Horsehead preset"
+	@echo "  make run-blowout     Run O star blowout preset"
 	@echo "  make container-run   Run inside Apptainer container"
 	@echo "  make container-train Train ML accelerator in container"
 	@echo "  make train           Train ML accelerator locally"
@@ -67,10 +68,31 @@ run:
 		$(if $(ACCELERATOR),--accelerator $(ACCELERATOR))
 
 run-orion:
-	$(PYTHON) -m prism3d.run --orion-bar --n $(N) --output $(OUTPUT)/orion_bar
+	@mkdir -p $(OUTPUT)/orion_bar
+	apptainer exec $(BIND_SRC) \
+		--bind $(abspath $(OUTPUT)/orion_bar):/output \
+		$(if $(ACCELERATOR),--bind $(abspath $(ACCELERATOR)):/model/accelerator.pkl) \
+		$(CONTAINER) \
+		python -m prism3d.run --orion-bar --n $(N) --output /output \
+		$(if $(ACCELERATOR),--accelerator /model/accelerator.pkl)
 
 run-horsehead:
-	$(PYTHON) -m prism3d.run --horsehead --n $(N) --output $(OUTPUT)/horsehead
+	@mkdir -p $(OUTPUT)/horsehead
+	apptainer exec $(BIND_SRC) \
+		--bind $(abspath $(OUTPUT)/horsehead):/output \
+		$(if $(ACCELERATOR),--bind $(abspath $(ACCELERATOR)):/model/accelerator.pkl) \
+		$(CONTAINER) \
+		python -m prism3d.run --horsehead --n $(N) --output /output \
+		$(if $(ACCELERATOR),--accelerator /model/accelerator.pkl)
+
+run-blowout:
+	@mkdir -p $(OUTPUT)/blowout
+	apptainer exec $(BIND_SRC) \
+		--bind $(abspath $(OUTPUT)/blowout):/output \
+		$(if $(ACCELERATOR),--bind $(abspath $(ACCELERATOR)):/model/accelerator.pkl) \
+		$(CONTAINER) \
+		python -m prism3d.run --blowout --n $(N) --output /output \
+		$(if $(ACCELERATOR),--accelerator /model/accelerator.pkl)
 
 run-config:
 	$(PYTHON) -m prism3d.run --config $(CONFIG) --output $(OUTPUT)
